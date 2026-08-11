@@ -9,6 +9,10 @@ html电缆/
 *.sv$
 *.ac$
 
+# Python 缓存
+__pycache__/
+*.pyc
+
 # 系统与编辑器
 Thumbs.db
 desktop.ini
