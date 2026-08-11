@@ -293,6 +293,37 @@ const CableRenderer = {
   }
 };
 
+// 把当前视图打包成「参数区」，塞进固定的 Python 模板，产出一键出 DXF 的脚本。
+const PythonExporter = {
+  buildParams(project, blocks, viewName) {
+    const names = new Set(blocks.map((block) => block.name));
+    return {
+      projectName: project.projectName,
+      viewName,
+      direction: project.settings.direction,
+      firstDistance: project.settings.firstDistance,
+      distanceStep: project.settings.distanceStep,
+      textHeight: project.settings.textHeight,
+      terminalBlocks: blocks.map((block) => ({ name: block.name, terminals: block.terminals.map((terminal) => terminal.number) })),
+      // 端子排名称对得上就一起导出，端子号有问题的记录交给脚本报「跳过」，不在这里悄悄丢掉。
+      connections: project.connections.filter((connection) => names.has(connection.terminalBlock)).map((connection) => ({
+        terminalBlock: connection.terminalBlock,
+        terminal: connection.terminal,
+        principle: connection.principle,
+        fromCabinet: connection.fromCabinet,
+        toCabinet: connection.toCabinet,
+        cableNumber: connection.cableNumber,
+        cableSpec: connection.cableSpec
+      }))
+    };
+  },
+  build(project, blocks, viewName) {
+    if (!window.PYTHON_DXF_TEMPLATE) throw new Error("缺少 python-template.js");
+    const params = JSON.stringify(this.buildParams(project, blocks, viewName), null, 2);
+    return window.PYTHON_DXF_TEMPLATE.replace("__PARAMS__", () => params);
+  }
+};
+
 const ProjectManager = {
   project: DataManager.normalize(clone(BUILTIN_PROJECT)),
   activeBlockIndex: 0,
@@ -348,6 +379,7 @@ const WorkflowManager = {
     $("#replaceConnectionsMode").addEventListener("click", () => this.setImportMode("replace"));
     $("#appendConnectionsMode").addEventListener("click", () => this.setImportMode("append"));
     $("#applyConnectionsBtn").addEventListener("click", () => this.applyConnections());
+    $("#workflowExportPyBtn").addEventListener("click", () => { UIManager.exportPython(); });
     $("#finishWorkflowBtn").addEventListener("click", () => this.finish());
     $$('[data-workflow-back]').forEach((button) => button.addEventListener("click", () => this.goToStep(Number(button.dataset.workflowBack))));
     $$('[data-workflow-nav]').forEach((button) => button.addEventListener("click", () => {
@@ -606,7 +638,7 @@ const WorkflowManager = {
       ["唯一电缆", cableCount]
     ];
     $("#workflowSummaryGrid").innerHTML = values.map(([label, value]) => `<div class="workflow-summary-item"><span>${label}</span><strong>${value}</strong></div>`).join("");
-    $(".workflow-next-actions span").textContent = issues.length ? `已生成预览，同时发现 ${issues.length} 个数据提示，请在右侧“数据检查”中处理。` : "数据检查通过。请检查每根电缆的阶梯顺序，再保存 JSON 或导出 SVG。";
+    $(".workflow-next-actions span").textContent = issues.length ? `已生成预览，同时发现 ${issues.length} 个数据提示；规格未填写不影响出图，脚本会把该列写成“未填写”。` : "数据检查通过，可以直接生成出图脚本。";
   },
   persistDraft() {
     try {
@@ -726,6 +758,7 @@ const UIManager = {
     $("#fileInput").addEventListener("change", (event) => this.openFile(event));
     $("#saveBtn").addEventListener("click", () => this.saveJson());
     $("#exportSvgBtn").addEventListener("click", () => this.exportSvg());
+    $("#exportPyBtn").addEventListener("click", () => this.exportPython());
     $("#projectName").addEventListener("input", (event) => this.mutate(() => ProjectManager.project.projectName = event.target.value, { sidebar: false }));
     $("#addBlockBtn").addEventListener("click", () => this.addBlock());
     $("#deleteBlockBtn").addEventListener("click", () => this.deleteBlock());
@@ -1051,6 +1084,20 @@ const UIManager = {
     const source = `<?xml version="1.0" encoding="UTF-8"?>\n<svg xmlns="http://www.w3.org/2000/svg" width="${(width / UNIT_SCALE).toFixed(1)}mm" height="${(height / UNIT_SCALE).toFixed(1)}mm" viewBox="0 0 ${width} ${height}"><style>${this.exportSvgStyles()}</style>${$("#wiringSvg").innerHTML}</svg>`;
     DataManager.download(source, `${safeFileName(ProjectManager.project.projectName)}-${safeFileName(ProjectManager.activeViewName)}.svg`, "image/svg+xml;charset=utf-8");
     this.toast("当前端子排 SVG 已导出");
+  },
+  exportPython() {
+    const blocks = ProjectManager.activeBlocks;
+    if (!blocks.length || !blocks.some((block) => block.terminals.length)) return this.toast("当前没有可出图的端子排");
+    const viewName = ProjectManager.activeViewName;
+    let content;
+    try {
+      content = PythonExporter.build(ProjectManager.project, blocks, viewName);
+    } catch (error) {
+      return this.toast(`生成脚本失败：${error.message}`);
+    }
+    DataManager.download(content, `${safeFileName(ProjectManager.project.projectName)}-${safeFileName(viewName)}-出图.py`, "text/x-python;charset=utf-8");
+    const errors = this.issues.filter((issue) => issue.type === "error").length;
+    this.toast(errors ? `出图脚本已导出，注意还有 ${errors} 个错误未处理` : "出图脚本已导出，运行它即生成 DXF");
   },
   exportSvgStyles() {
     return `.svg-frame{fill:#fff;stroke:#b8c4c1}.svg-title{fill:#425157;font-family:'Microsoft YaHei UI';font-weight:700}.svg-subtitle{fill:#82908e;font-family:Consolas}.terminal-block-frame rect,.terminal-block-frame line,.terminal-divider{fill:none;stroke:#526368;stroke-width:1}.terminal-hit-area{fill:transparent;stroke:none}.terminal-number,.terminal-block-name,.principle-label{fill:#1e2c31;font-family:Consolas,'Microsoft YaHei UI';text-anchor:middle;dominant-baseline:middle}.terminal-number,.terminal-block-name{font-weight:700}.principle-label{fill:#536167}.cable-line,.cable-chevron{fill:none;stroke:#278394;stroke-width:2}.cable-label-bg{fill:#fff}.cable-label{fill:#1f4f59;font-family:Consolas;font-weight:700}.cable-destination,.cable-spec{fill:#34464b;font-family:'Microsoft YaHei UI'}`;

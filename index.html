@@ -17,7 +17,8 @@
         <button class="button workflow-launch" id="workflowBtn" type="button"><span class="icon">▷</span>开始工作流</button>
         <button class="button" id="openBtn" type="button"><span class="icon">↥</span>打开 JSON</button>
         <button class="button" id="saveBtn" type="button"><span class="icon">↓</span>保存 JSON</button>
-        <button class="button button-primary" id="exportSvgBtn" type="button"><span class="icon">⇩</span>导出 SVG</button>
+        <button class="button" id="exportSvgBtn" type="button"><span class="icon">⇩</span>导出 SVG</button>
+        <button class="button button-primary" id="exportPyBtn" type="button"><span class="icon">▣</span>生成出图脚本</button>
         <input id="fileInput" type="file" accept=".json,application/json" hidden>
       </div>
     </header>
@@ -187,17 +188,18 @@
 
         <section class="workflow-panel" data-workflow-panel="4">
           <div class="workflow-complete-mark" aria-hidden="true">✓</div>
-          <div class="workflow-complete-copy"><span class="workflow-kicker">第四步</span><h3>接线预览已经生成</h3><p>项目数据已经进入当前编辑器，可以继续逐项调整、保存 JSON 或导出 SVG。</p></div>
+          <div class="workflow-complete-copy"><span class="workflow-kicker">第四步</span><h3>接线已经排好，可以出图了</h3><p>点“生成 DXF 出图脚本”会下载一个 Python 脚本，双击或 <code>python 脚本名.py</code> 运行即在同目录生成 DXF，直接用 CAD 打开。脚本里只有顶部参数区随本次输入变化，改完参数重新运行即可重出图。</p></div>
           <div class="workflow-summary-grid" id="workflowSummaryGrid"></div>
           <div class="workflow-next-actions">
             <strong>下一步建议</strong>
-            <span>先在右侧预览中检查每根电缆的阶梯顺序，再处理数据检查中的警告。</span>
+            <span>先在预览中检查每根电缆的阶梯顺序，再处理数据检查中的警告。</span>
           </div>
-          <footer class="workflow-footer"><button class="button" data-workflow-back="3" type="button">← 返回接线资料</button><button class="button button-primary" id="finishWorkflowBtn" type="button">进入接线预览</button></footer>
+          <footer class="workflow-footer"><button class="button" data-workflow-back="3" type="button">← 返回接线资料</button><div class="workflow-footer-actions"><button class="button" id="finishWorkflowBtn" type="button">先看接线预览</button><button class="button button-primary" id="workflowExportPyBtn" type="button">生成 DXF 出图脚本</button></div></footer>
         </section>
       </div>
     </section>
   </div>
+  <script src="python-template.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
