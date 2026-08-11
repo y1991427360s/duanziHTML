@@ -1,3 +1,6 @@
 * text=auto eol=lf
+# 批处理必须是 CRLF，否则 cmd.exe 会把命令行拆错，出现「'5001' 不是内部或外部命令」之类的报错
+*.cmd text eol=crlf
+*.bat text eol=crlf
 *.dwg binary
 *.xlsx binary
