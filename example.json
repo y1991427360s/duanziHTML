@@ -1,0 +1,38 @@
+{
+  "projectName": "示例二次接线项目",
+  "terminalBlocks": [
+    {
+      "name": "ZD",
+      "terminals": [
+        {"number": "1"}, {"number": "2"}, {"number": "3"}, {"number": "4"},
+        {"number": "5"}, {"number": "6"}, {"number": "7"}, {"number": "8"},
+        {"number": "9"}, {"number": "10"}, {"number": "11"}, {"number": "12"},
+        {"number": "13"}, {"number": "14"}
+      ]
+    },
+    {
+      "name": "11D",
+      "terminals": [
+        {"number": "1"}, {"number": "2"}, {"number": "3"}, {"number": "4"},
+        {"number": "5"}, {"number": "6"}, {"number": "7"}, {"number": "8"}
+      ]
+    }
+  ],
+  "connections": [
+    {"terminalBlock":"ZD","terminal":"1","principle":"+KM1","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"直流馈线柜","cableNumber":"ZL-01","cableSpec":"2×4"},
+    {"terminalBlock":"ZD","terminal":"8","principle":"-KM1","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"直流馈线柜","cableNumber":"ZL-01","cableSpec":"2×4"},
+    {"terminalBlock":"ZD","terminal":"5","principle":"+KM2","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"直流馈线柜","cableNumber":"ZL-02","cableSpec":"2×4"},
+    {"terminalBlock":"ZD","terminal":"12","principle":"-KM2","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"直流馈线柜","cableNumber":"ZL-02","cableSpec":"2×4"},
+    {"terminalBlock":"ZD","terminal":"2","principle":"B+","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"远动通信柜","cableNumber":"DS-01","cableSpec":"通讯线"},
+    {"terminalBlock":"ZD","terminal":"3","principle":"B-","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"远动通信柜","cableNumber":"DS-01","cableSpec":"通讯线"},
+    {"terminalBlock":"ZD","terminal":"4","principle":"TX+","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"调度数据网柜","cableNumber":"DS-02","cableSpec":"屏蔽双绞线"},
+    {"terminalBlock":"ZD","terminal":"6","principle":"TX-","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"调度数据网柜","cableNumber":"DS-02","cableSpec":"屏蔽双绞线"},
+    {"terminalBlock":"ZD","terminal":"7","principle":"A","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"故障录波柜","cableNumber":"DS-03","cableSpec":"4×1.5"},
+    {"terminalBlock":"ZD","terminal":"10","principle":"B","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"故障录波柜","cableNumber":"DS-03","cableSpec":"4×1.5"},
+    {"terminalBlock":"ZD","terminal":"9","principle":"COM","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"电能质量柜","cableNumber":"DS-04","cableSpec":"2×2.5"},
+    {"terminalBlock":"ZD","terminal":"14","principle":"SIG","fromCabinet":"公用测控及时钟同步系统柜","toCabinet":"电能质量柜","cableNumber":"DS-04","cableSpec":"2×2.5"},
+    {"terminalBlock":"11D","terminal":"1","principle":"101","fromCabinet":"线路保护柜","toCabinet":"断路器机构箱","cableNumber":"KZ-01","cableSpec":"4×2.5"},
+    {"terminalBlock":"11D","terminal":"6","principle":"102","fromCabinet":"线路保护柜","toCabinet":"断路器机构箱","cableNumber":"KZ-01","cableSpec":"4×2.5"}
+  ],
+  "settings": {"direction":"DOWN","firstDistance":10,"distanceStep":5,"textHeight":3}
+}

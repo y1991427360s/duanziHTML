@@ -1,0 +1,125 @@
+{
+  "projectName": "公用测控及时钟同步系统柜端子接线示例",
+  "terminalBlocks": [
+    {
+      "name": "2ID",
+      "terminals": [
+        {"number":"1"}, {"number":"2"}, {"number":"3"}, {"number":"4"},
+        {"number":"5"}, {"number":"6"}, {"number":"7"}, {"number":"8"},
+        {"number":"9"}, {"number":"10"}, {"number":"11"}, {"number":"12"},
+        {"number":"13"}, {"number":"14"}, {"number":"15"}, {"number":"16"},
+        {"number":"17"}, {"number":"18"}, {"number":"19"}, {"number":"20"},
+        {"number":"21"}, {"number":"22"}, {"number":"23"}, {"number":"24"},
+        {"number":"25"}, {"number":"26"}, {"number":"27"}, {"number":"28"},
+        {"number":"29"}, {"number":"30"}, {"number":"31"}, {"number":"32"},
+        {"number":"33"}, {"number":"34"}, {"number":"35"}, {"number":"36"},
+        {"number":"37"}, {"number":"38"}
+      ]
+    },
+    {
+      "name": "JD",
+      "terminals": [
+        {"number":"1"}, {"number":"2"}, {"number":"3"},
+        {"number":"4"}, {"number":"5"}, {"number":"6"}
+      ]
+    }
+  ],
+  "connections": [
+    {
+      "terminalBlock": "2ID",
+      "terminal": "1",
+      "principle": "2-12S-L401",
+      "fromCabinet": "公用测控及时钟同步系统柜",
+      "toCabinet": "10kV 张东10KV开闭所开关柜",
+      "cableNumber": "2-16S-101",
+      "cableSpec": "4×4"
+    },
+    {
+      "terminalBlock": "2ID",
+      "terminal": "2",
+      "principle": "2-12S-N401",
+      "fromCabinet": "公用测控及时钟同步系统柜",
+      "toCabinet": "10kV 张东10KV开闭所开关柜",
+      "cableNumber": "2-16S-101",
+      "cableSpec": "4×4"
+    },
+    {
+      "terminalBlock": "2ID",
+      "terminal": "4",
+      "principle": "2-15S-L401",
+      "fromCabinet": "公用测控及时钟同步系统柜",
+      "toCabinet": "10kV 硫酸变配电室二段",
+      "cableNumber": "2-15S-101",
+      "cableSpec": "4×4"
+    },
+    {
+      "terminalBlock": "2ID",
+      "terminal": "5",
+      "principle": "2-15S-N401",
+      "fromCabinet": "公用测控及时钟同步系统柜",
+      "toCabinet": "10kV 硫酸变配电室二段",
+      "cableNumber": "2-15S-101",
+      "cableSpec": "4×4"
+    },
+    {
+      "terminalBlock": "2ID",
+      "terminal": "7",
+      "principle": "2-16S-L401",
+      "fromCabinet": "公用测控及时钟同步系统柜",
+      "toCabinet": "10kV 烧成配电站二段",
+      "cableNumber": "2-12S-101",
+      "cableSpec": "4×4"
+    },
+    {
+      "terminalBlock": "2ID",
+      "terminal": "8",
+      "principle": "2-16S-N401",
+      "fromCabinet": "公用测控及时钟同步系统柜",
+      "toCabinet": "10kV 烧成配电站二段",
+      "cableNumber": "2-12S-101",
+      "cableSpec": "4×4"
+    },
+    {
+      "terminalBlock": "JD",
+      "terminal": "1",
+      "principle": "L",
+      "fromCabinet": "公用测控及时钟同步系统柜",
+      "toCabinet": "公用测控及时钟同步系统柜",
+      "cableNumber": "SML-06",
+      "cableSpec": "2×4"
+    },
+    {
+      "terminalBlock": "JD",
+      "terminal": "2",
+      "principle": "L",
+      "fromCabinet": "公用测控及时钟同步系统柜",
+      "toCabinet": "公用测控及时钟同步系统柜",
+      "cableNumber": "SML-06",
+      "cableSpec": "2×4"
+    },
+    {
+      "terminalBlock": "JD",
+      "terminal": "3",
+      "principle": "N",
+      "fromCabinet": "公用测控及时钟同步系统柜",
+      "toCabinet": "1#主变保护柜",
+      "cableNumber": "SML-05",
+      "cableSpec": "2×4"
+    },
+    {
+      "terminalBlock": "JD",
+      "terminal": "4",
+      "principle": "N",
+      "fromCabinet": "公用测控及时钟同步系统柜",
+      "toCabinet": "1#主变保护柜",
+      "cableNumber": "SML-05",
+      "cableSpec": "2×4"
+    }
+  ],
+  "settings": {
+    "direction": "DOWN",
+    "firstDistance": 10,
+    "distanceStep": 5,
+    "textHeight": 3
+  }
+}

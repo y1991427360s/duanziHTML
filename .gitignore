@@ -1,0 +1,17 @@
+# CAD 原始图纸与清册（约 55MB 二进制，且会被 CAD 反复改写）
+# 需要纳入版本控制时删掉这一行，并注意仓库体积会快速膨胀
+html电缆/
+
+# CAD 自动备份与打开时的锁文件
+*.bak
+*.dwl
+*.dwl2
+*.sv$
+*.ac$
+
+# 系统与编辑器
+Thumbs.db
+desktop.ini
+.DS_Store
+.vscode/
+.idea/

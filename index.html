@@ -1,0 +1,203 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>端子排接线规划器</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="app-shell">
+    <header class="topbar">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <div><h1>端子排接线规划器</h1><p>TERMINAL WIRING PLANNER / V1.0</p></div>
+      </div>
+      <div class="top-actions">
+        <button class="button workflow-launch" id="workflowBtn" type="button"><span class="icon">▷</span>开始工作流</button>
+        <button class="button" id="openBtn" type="button"><span class="icon">↥</span>打开 JSON</button>
+        <button class="button" id="saveBtn" type="button"><span class="icon">↓</span>保存 JSON</button>
+        <button class="button button-primary" id="exportSvgBtn" type="button"><span class="icon">⇩</span>导出 SVG</button>
+        <input id="fileInput" type="file" accept=".json,application/json" hidden>
+      </div>
+    </header>
+
+    <main class="workspace">
+      <aside class="sidebar">
+        <section class="project-panel">
+          <label for="projectName">项目名称</label>
+          <input id="projectName" class="project-name" type="text" aria-label="项目名称">
+          <div class="project-meta"><span id="saveState">本地示例</span><span id="validationCount">数据正常</span></div>
+        </section>
+
+        <div class="sidebar-tabs" role="tablist">
+          <button class="sidebar-tab active" data-tab="blocks" type="button">端子排</button>
+          <button class="sidebar-tab" data-tab="connections" type="button">接线</button>
+          <button class="sidebar-tab" data-tab="settings" type="button">参数</button>
+        </div>
+
+        <section class="tab-panel active" data-panel="blocks">
+          <div class="section-head"><div><span class="eyebrow">BLOCKS</span><h2>端子排</h2></div><button class="icon-button" id="addBlockBtn" type="button" title="新增端子排">＋</button></div>
+          <div id="blockList" class="block-list"></div>
+          <div class="terminal-editor">
+            <div class="inline-fields">
+              <label>当前名称<input id="blockName" type="text"></label>
+              <button class="danger-icon" id="deleteBlockBtn" type="button" title="删除当前端子排">×</button>
+            </div>
+            <label class="group-field">组合名称<input id="layoutGroup" type="text" placeholder="留空表示独立显示"></label>
+            <div class="section-head compact"><h3>端子顺序</h3><button class="small-button" id="addTerminalBtn" type="button">＋ 新增</button></div>
+            <div id="terminalList" class="terminal-list"></div>
+          </div>
+        </section>
+
+        <section class="tab-panel" data-panel="connections">
+          <div class="section-head"><div><span class="eyebrow">CONNECTIONS</span><h2>接线数据</h2></div><button class="icon-button" id="addConnectionBtn" type="button" title="新增接线">＋</button></div>
+          <p class="panel-note">当前端子排的接线点，修改后预览实时更新。</p>
+          <div id="orphanConnections" class="orphan-connections" hidden>
+            <div class="section-head compact"><h3>未归属的接线</h3><span id="orphanCount" class="count-badge">0</span></div>
+            <p class="panel-note">这些接线写的端子排在当前项目里不存在，改成正确的端子排名称或直接删除。</p>
+            <div id="orphanConnectionList" class="connection-list"></div>
+          </div>
+          <div id="connectionList" class="connection-list"></div>
+        </section>
+
+        <section class="tab-panel" data-panel="settings">
+          <div class="section-head"><div><span class="eyebrow">LAYOUT</span><h2>绘图参数</h2></div></div>
+          <div class="settings-form">
+            <fieldset><legend>接线方向</legend><div class="segmented"><button id="dirDown" type="button">向下</button><button id="dirUp" type="button">向上</button></div></fieldset>
+            <div class="fixed-drawing-spec"><span>端子号栏高度</span><strong>5</strong><small>固定</small></div>
+            <label>首层间距 <span id="firstDistanceValue"></span><input id="firstDistance" type="range" min="5" max="30" step="1"></label>
+            <label>层间距 <span id="distanceStepValue"></span><input id="distanceStep" type="range" min="2" max="15" step="1"></label>
+            <label>文字高度 <span id="textHeightValue"></span><input id="textHeight" type="range" min="2" max="6" step="0.5"></label>
+          </div>
+          <div class="formula-box"><span>排线层级规则</span><code>最左接线端子优先，层间距仅控制视觉展开</code></div>
+        </section>
+      </aside>
+
+      <section class="main-stage">
+        <div class="stage-head">
+          <div>
+            <div class="breadcrumb"><span id="activeBlockName">ZD</span><b>/</b><span>接线展开图</span></div>
+            <h2 id="stageTitle">端子排接线预览</h2>
+          </div>
+          <div class="view-tools" aria-label="视图控制">
+            <button id="zoomOutBtn" type="button" title="缩小">−</button>
+            <button id="resetZoomBtn" type="button" title="恢复 100%"><span id="zoomLabel">100%</span></button>
+            <button id="zoomInBtn" type="button" title="放大">＋</button>
+            <span class="tool-divider"></span>
+            <button id="fitBtn" type="button" title="适应窗口">适应窗口</button>
+          </div>
+        </div>
+
+        <div class="canvas-wrap" id="canvasWrap">
+          <div class="canvas-grid"></div>
+          <svg id="wiringSvg" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="端子排接线图"></svg>
+          <div id="emptyState" class="empty-state" hidden><strong>暂无可绘制端子</strong><span>请在左侧新增端子，或打开一个 JSON 项目。</span></div>
+          <div class="canvas-hint">滚轮缩放 · 拖动平移 · 双击恢复</div>
+        </div>
+
+        <div class="status-strip">
+          <button class="metric" id="cableMetric" type="button"><span>电缆总数</span><strong id="cableCount">0</strong><small>根</small></button>
+          <div class="metric"><span>接线点</span><strong id="connectionCount">0</strong><small>处</small></div>
+          <div class="metric"><span>当前端子数</span><strong id="terminalCount">0</strong><small>个</small></div>
+          <div class="metric"><span>接线方向</span><strong id="directionValue">—</strong><small>预览</small></div>
+        </div>
+      </section>
+
+      <aside class="inspector">
+        <div class="inspector-head"><span class="eyebrow">INSPECTOR</span><h2>电缆信息</h2></div>
+        <div id="cableInspector" class="cable-inspector"></div>
+        <div class="issues-panel">
+          <div class="section-head compact"><h3>数据检查</h3><span id="issueBadge" class="count-badge">0</span></div>
+          <div id="issueList" class="issue-list"></div>
+        </div>
+      </aside>
+    </main>
+  </div>
+
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
+
+  <div class="workflow-overlay" id="workflowOverlay" hidden>
+    <section class="workflow-dialog" role="dialog" aria-modal="true" aria-labelledby="workflowTitle">
+      <header class="workflow-header">
+        <div>
+          <span class="eyebrow">GUIDED WORKFLOW</span>
+          <h2 id="workflowTitle">端子排接线工作流</h2>
+          <p id="workflowSubtitle">直接粘贴厂家端子排清单</p>
+        </div>
+        <button class="workflow-close" id="workflowCloseBtn" type="button" title="关闭工作流">×</button>
+      </header>
+
+      <nav class="workflow-steps" aria-label="工作流步骤">
+        <button class="workflow-step active" data-workflow-nav="1" type="button"><b>01</b><span>端子清单</span></button>
+        <button class="workflow-step" data-workflow-nav="2" type="button"><b>02</b><span>核对端子</span></button>
+        <button class="workflow-step" data-workflow-nav="3" type="button"><b>03</b><span>导入接线</span></button>
+        <button class="workflow-step" data-workflow-nav="4" type="button"><b>04</b><span>完成预览</span></button>
+      </nav>
+
+      <div class="workflow-body">
+        <section class="workflow-panel active" data-workflow-panel="1">
+          <div class="workflow-intro">
+            <span class="workflow-kicker">第一步</span>
+            <h3>一块端子排一行：先写名称，再写端子号</h3>
+            <p>每一行（或每个分号）就是一块端子排：第一项是端子排名称，后面全部当成端子号，<code>N</code>、<code>PE</code>、<code>1A</code> 这类带字母的端子号也可以直接写。物理上连在一起的几块端子排写在同一段里，中间空一行就换成下一个组合。</p>
+          </div>
+          <div class="terminal-sequence-guide">
+            <div><span>端子排名称</span><strong>1ZD</strong></div><i>、</i><div><span>端子号（可带字母）</span><strong>1、2、3、N、PE</strong></div><i>换行或；</i><div><span>下一块端子排</span><strong>2ZD、1、2、3</strong></div>
+          </div>
+          <div class="workflow-section workflow-response-section">
+            <div class="workflow-section-head"><div><h4>厂家端子排清单</h4><span>逗号、顿号、Tab 分项；换行或分号换端子排；空行换物理组合</span></div><button class="small-button" id="useCurrentTemplateBtn" type="button">使用当前模板</button></div>
+            <textarea id="terminalSequenceInput" class="workflow-textarea terminal-sequence-textarea" placeholder="1ZD、1、2、3、4、5、6、7&#10;2ZD、1、2、3、N、PE&#10;&#10;JD、1、2、3、4"></textarea>
+            <div class="workflow-inline-result" id="templateParseResult">等待粘贴端子排清单</div>
+          </div>
+          <footer class="workflow-footer"><span>同一段里的多块端子排会按顺序连续绘制；单独一段的端子排独立显示。</span><button class="button button-primary" id="parseTerminalSequenceBtn" type="button">解析并核对端子 →</button></footer>
+        </section>
+
+        <section class="workflow-panel" data-workflow-panel="2">
+          <div class="workflow-intro">
+            <span class="workflow-kicker">第二步</span>
+            <h3>核对自动拆分出的端子排</h3>
+            <p>确认端子排名称、数量和端子顺序。同一段里的多块端子排会标为连续组合，单独一段的端子排显示为独立。</p>
+          </div>
+          <div class="template-review" id="templateReview"></div>
+          <div class="workflow-issues" id="templateReviewIssues"></div>
+          <footer class="workflow-footer"><button class="button" data-workflow-back="1" type="button">← 返回清单</button><div class="workflow-footer-actions"><button class="button" id="importTemplateOnlyBtn" type="button">仅导入端子排，稍后接线</button><button class="button button-primary" id="confirmTemplateBtn" type="button">确认模板并继续接线 →</button></div></footer>
+        </section>
+
+        <section class="workflow-panel" data-workflow-panel="3">
+          <div class="workflow-intro">
+            <span class="workflow-kicker">第三步</span>
+            <h3>粘贴接线资料</h3>
+            <p>一条记录写<b>端子号、原理号</b>；这根电缆的最后一条记录再补上<b>去向柜</b>。没有写去向柜的记录，自动和它后面第一条写了去向柜的记录归成同一根电缆。记录之间用分号或换行分隔。</p>
+          </div>
+          <div class="connection-format-strip">
+            <span>端子号</span><i>、</i><span>原理号</span><i>；</i><span>端子号</span><i>、</i><span>原理号</span><i>、</i><span>去向柜＝这根电缆到此为止</span>
+          </div>
+          <textarea id="workflowConnectionInput" class="workflow-textarea connection-import-textarea" placeholder="ZD1、+KM1；&#10;ZD11、-KM1、直流馈线柜；&#10;1-2ID4、1(2)B-N4121；&#10;1-2ID1、1(2)B-A4121；&#10;1-2ID2、1(2)B-B4121；&#10;1-2ID3、1(2)B-C4121、35kV 1(2)#主变进线柜"></textarea>
+          <div class="connection-import-tools">
+            <div class="segmented compact-segmented" aria-label="接线导入方式"><button id="replaceConnectionsMode" class="active" type="button">替换现有接线</button><button id="appendConnectionsMode" type="button">追加到现有接线</button></div>
+            <label class="import-field">起点柜<input id="workflowFromCabinet" type="text" placeholder="本柜名称，可留空"></label>
+            <label class="import-field">电缆号前缀<input id="workflowCablePrefix" type="text" placeholder="WL"></label>
+            <button class="button" id="parseConnectionsBtn" type="button">解析接线资料</button>
+          </div>
+          <div class="connection-preview-summary" id="connectionPreviewSummary">尚未解析接线资料</div>
+          <div class="workflow-table-wrap"><table class="workflow-table"><thead><tr><th>状态</th><th>端子</th><th>原理号</th><th>归属电缆</th><th>去向柜</th><th>说明</th></tr></thead><tbody id="connectionPreviewBody"><tr><td colspan="6">等待解析</td></tr></tbody></table></div>
+          <footer class="workflow-footer"><button class="button" data-workflow-back="2" type="button">← 返回核对</button><button class="button button-primary" id="applyConnectionsBtn" type="button" disabled>应用接线并生成预览 →</button></footer>
+        </section>
+
+        <section class="workflow-panel" data-workflow-panel="4">
+          <div class="workflow-complete-mark" aria-hidden="true">✓</div>
+          <div class="workflow-complete-copy"><span class="workflow-kicker">第四步</span><h3>接线预览已经生成</h3><p>项目数据已经进入当前编辑器，可以继续逐项调整、保存 JSON 或导出 SVG。</p></div>
+          <div class="workflow-summary-grid" id="workflowSummaryGrid"></div>
+          <div class="workflow-next-actions">
+            <strong>下一步建议</strong>
+            <span>先在右侧预览中检查每根电缆的阶梯顺序，再处理数据检查中的警告。</span>
+          </div>
+          <footer class="workflow-footer"><button class="button" data-workflow-back="3" type="button">← 返回接线资料</button><button class="button button-primary" id="finishWorkflowBtn" type="button">进入接线预览</button></footer>
+        </section>
+      </div>
+    </section>
+  </div>
+  <script src="app.js"></script>
+</body>
+</html>
