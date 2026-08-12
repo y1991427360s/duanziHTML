@@ -360,6 +360,7 @@ const WorkflowManager = {
   pendingProject: null,
   parsedConnections: [],
   parsedCables: [],
+  mergedSegments: new Map(),
   importMode: "replace",
   draftKey: "terminal-planner-workflow-draft-v3",
   subtitles: {
@@ -424,7 +425,7 @@ const WorkflowManager = {
   },
   tokenizeTerminalSequence(text) {
     return String(text || "")
-      .split(/[\t,，、]+/)
+      .split(/[\t,，、:：]+/)
       .map((token) => token.trim().replace(/[。.!！]+$/g, ""))
       .filter(Boolean);
   },
@@ -436,14 +437,22 @@ const WorkflowManager = {
       if (!segments.length) throw new Error("请先粘贴端子排名称和端子号");
       const terminalBlocks = [];
       segments.forEach((segment, segmentIndex) => {
-        const units = segment.split(/[;；\r\n]+/).map((unit) => unit.trim()).filter(Boolean);
+        const units = segment.split(/[;；|｜\r\n]+/).map((unit) => unit.trim()).filter(Boolean);
         const groupBlocks = [];
+        const byName = new Map();
         units.forEach((unit) => {
           let current = null;
           this.tokenizeTerminalSequence(unit).forEach((token, index) => {
-            // 每段的第一项是名称；中途再遇到像端子排名称的项就自动开下一块
+            // 每段的第一项是名称；中途再遇到像端子排名称的项就自动开下一块；
+            // 同一个名称分成几段写（厂家图里一条端子排画成两截）会接到同一块上。
             if (index === 0 || !current || looksLikeBlockName(token)) {
-              current = { name: token, layoutGroup: "", terminals: [] };
+              if (byName.has(token)) {
+                current = byName.get(token);
+                current.segments += 1;
+                return;
+              }
+              current = { name: token, layoutGroup: "", terminals: [], segments: 1 };
+              byName.set(token, current);
               groupBlocks.push(current);
               terminalBlocks.push(current);
               return;
@@ -456,6 +465,7 @@ const WorkflowManager = {
       if (!terminalBlocks.length) throw new Error("没有解析到任何端子排");
       const empty = terminalBlocks.find((block) => !block.terminals.length);
       if (empty) throw new Error(`端子排“${empty.name}”后面没有端子号`);
+      this.mergedSegments = new Map(terminalBlocks.filter((block) => block.segments > 1).map((block) => [block.name, block.segments]));
       this.pendingProject = DataManager.normalize({
         projectName: ProjectManager.project.projectName || "手动端子排模板",
         terminalBlocks,
@@ -474,6 +484,7 @@ const WorkflowManager = {
   },
   useCurrentTemplate() {
     if (!ProjectManager.project.terminalBlocks.length) return UIManager.toast("当前项目没有可使用的端子模板");
+    this.mergedSegments = new Map();
     this.pendingProject = DataManager.normalize({ ...clone(ProjectManager.project), connections: [] });
     this.renderTemplateReview();
     this.goToStep(2);
@@ -481,7 +492,8 @@ const WorkflowManager = {
   renderTemplateReview() {
     const project = this.pendingProject;
     if (!project) return;
-    $("#templateReview").innerHTML = project.terminalBlocks.map((block) => `<div class="template-review-row"><strong>${escapeHtml(block.name)}</strong><span>${block.terminals.length} 个端子${block.layoutGroup ? " · 连续组合" : " · 独立"}</span><div class="template-terminal-sequence" title="${escapeHtml(block.terminals.map((terminal) => terminal.number).join("、"))}">${escapeHtml(block.terminals.map((terminal) => terminal.number).join(" · "))}</div></div>`).join("");
+    const merged = this.mergedSegments || new Map();
+    $("#templateReview").innerHTML = project.terminalBlocks.map((block) => `<div class="template-review-row"><strong>${escapeHtml(block.name)}</strong><span>${block.terminals.length} 个端子${merged.has(block.name) ? ` · ${merged.get(block.name)} 段接成一块` : block.layoutGroup ? " · 连续组合" : " · 独立"}</span><div class="template-terminal-sequence" title="${escapeHtml(block.terminals.map((terminal) => terminal.number).join("、"))}">${escapeHtml(block.terminals.map((terminal) => terminal.number).join(" · "))}</div></div>`).join("");
     const issues = ValidationManager.validate(project);
     const suspicious = [];
     project.terminalBlocks.forEach((block) => {
@@ -524,9 +536,9 @@ const WorkflowManager = {
       while (fields.length && !fields[fields.length - 1]) fields.pop();
       if (fields.length) records.push(fields);
     };
-    String(text || "").split(/[;；\r\n]+/).map((unit) => unit.trim()).filter(Boolean).forEach((unit) => {
+    String(text || "").split(/[;；|｜\r\n]+/).map((unit) => unit.trim()).filter(Boolean).forEach((unit) => {
       let current = [];
-      unit.split(/[\t,，、]/).map((field) => field.trim()).forEach((field) => {
+      unit.split(/[\t,，、:：]/).map((field) => field.trim()).forEach((field) => {
         if (current.length && this.looksLikeReference(field)) {
           push(current);
           current = [field];

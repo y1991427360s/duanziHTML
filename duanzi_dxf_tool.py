@@ -31,8 +31,8 @@ try:
 except Exception:
     pass
 
-FIELD_SPLIT = re.compile(r"[\t,，、]")
-RECORD_SPLIT = re.compile(r"[;；\r\n]+")
+FIELD_SPLIT = re.compile(r"[\t,，、:：]")
+RECORD_SPLIT = re.compile(r"[;；|｜\r\n]+")
 # 端子排名称：含字母或汉字、以 D 结尾，例如 ZD、1-2ID、JD、1-2UD、11YD、TD
 BLOCK_NAME_HINT = re.compile(r"^[0-9\-]*[A-Za-z一-龥][0-9A-Za-z一-龥\-]*[Dd]$")
 CJK_START = 0x2E80
@@ -84,15 +84,22 @@ def looks_like_block_name(token: str) -> bool:
 
 def parse_terminals(text: str):
     """一块端子排一行：第一项是名称，其余是端子号。
-    整段用顿号连着粘过来也认：中途遇到像端子排名称的项就自动开下一块。"""
+    整段用顿号连着粘过来也认：中途遇到像端子排名称的项就自动开下一块。
+    同一个名称分成几段写（厂家图里一条端子排画成两截）会自动接成一块，按出现顺序续端子号。"""
     blocks: list[dict] = []
     errors: list[str] = []
+    index: dict[str, dict] = {}
     for unit in [u.strip() for u in RECORD_SPLIT.split(text or "") if u.strip()]:
         current: dict | None = None
-        for index, token in enumerate(clean_tokens(unit)):
-            if index == 0 or looks_like_block_name(token) or current is None:
-                current = {"name": token, "terminals": []}
-                blocks.append(current)
+        for position, token in enumerate(clean_tokens(unit)):
+            if position == 0 or looks_like_block_name(token) or current is None:
+                if token in index:
+                    current = index[token]
+                    current["segments"] += 1
+                else:
+                    current = {"name": token, "terminals": [], "segments": 1}
+                    index[token] = current
+                    blocks.append(current)
                 continue
             current["terminals"].append(token)
     for block in blocks:
@@ -110,13 +117,20 @@ def parse_terminals(text: str):
         if repeated:
             errors.append("端子排「%s」里这些端子号出现了不止一次：%s" % (block["name"], "、".join(repeated)))
         block["terminals"] = kept
-    names = [b["name"] for b in blocks]
-    for name in sorted(set(names)):
-        if names.count(name) > 1:
-            errors.append("端子排名称「%s」出现了 %d 次，同名的请合成一块" % (name, names.count(name)))
     if not blocks and not errors:
         errors.append("上面的端子排还没填")
     return blocks, errors
+
+
+def describe_blocks(blocks: list[dict], with_numbers: bool = False) -> list[str]:
+    out = []
+    for block in blocks:
+        merged = "，%d 段接成一块" % block.get("segments", 1) if block.get("segments", 1) > 1 else ""
+        if with_numbers:
+            out.append("%s：%s%s" % (block["name"], "、".join(block["terminals"]) or "（没有端子号）", merged))
+        else:
+            out.append("%s（%d 个端子%s）" % (block["name"], len(block["terminals"]), merged))
+    return out
 
 
 def resolve_reference(reference: str, blocks: list[dict]):
@@ -469,8 +483,7 @@ def generate(payload: dict) -> dict:
         shown = errors[:10]
         if len(errors) > len(shown):
             shown.append("……还有 %d 条类似问题，先把上面这些改掉再点一次" % (len(errors) - len(shown)))
-        return {"ok": False, "errors": shown,
-                "parsed": ["%s：%s" % (b["name"], "、".join(b["terminals"]) or "（没有端子号）") for b in blocks]}
+        return {"ok": False, "errors": shown, "parsed": describe_blocks(blocks, with_numbers=True)}
     params = {
         "projectName": cabinet or "端子排接线图",
         "direction": payload.get("direction") or DEFAULTS["direction"],
@@ -495,7 +508,7 @@ def generate(payload: dict) -> dict:
         "verify": verify(target, DRAWING),
         "warnings": warnings + result["skipped"],
         "size": "%s × %s mm" % result["size"],
-        "parsed": ["%s（%d 个端子）" % (b["name"], len(b["terminals"])) for b in blocks],
+        "parsed": describe_blocks(blocks),
         "stats": {"blocks": result["blocks"], "terminals": result["terminals"],
                   "cables": result["cables"], "points": result["points"]},
         "cables": [{"number": c["number"], "destination": c["destination"] or "未填写",
@@ -589,7 +602,7 @@ PAGE = """<!doctype html>
 
   <div class="step">
     <h2><span class="num">1</span>有哪些端子排</h2>
-    <p class="tip">一块端子排写一行：<b>先写端子排名称，后面挨着写端子号</b>，中间用顿号或逗号隔开。<code>N</code>、<code>PE</code>、<code>1A</code> 这种端子号照写。<br>整段从别处复制过来、全部用顿号连成一行也行，遇到下一个端子排名称会自动断开。</p>
+    <p class="tip">一块端子排写一行：<b>先写端子排名称，后面挨着写端子号</b>，中间用顿号或逗号隔开。<code>N</code>、<code>PE</code>、<code>1A</code> 这种端子号照写。<br>整段从别处复制过来、全部用顿号连成一行也行，遇到下一个端子排名称会自动断开。同一个端子排分成几段写（比如 <code>CD：1…25 ｜ CD：26…36</code>）会自动接成一块。</p>
     <textarea id="terminals" rows="6" placeholder="ZD、1、11&#10;1-2ID、1、2、3、4&#10;JD、1、4"></textarea>
   </div>
 
