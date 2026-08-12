@@ -4,8 +4,7 @@
 双击 `出图工具.cmd`（或运行 python duanzi_dxf_tool.py）后浏览器会自动打开一个很简单的页面：
 两个输入框 + 一个按钮，点一下就在桌面生成 DXF 并自动用 CAD 打开。
 
-不需要学习界面，也不需要先生成脚本。想要可视化核对、逐条编辑、导出 SVG 时
-再用同目录的 index.html（完整版）。
+不需要学习界面，也不需要先生成脚本。
 
 启动器 `出图工具.cmd` 的内容必须保持纯 ASCII 且用 CRLF 换行，所以本文件用英文名；
 cmd.exe 按系统代码页读批处理，UTF-8 中文或 LF 换行都会让它把命令行拆错。
@@ -35,6 +34,9 @@ FIELD_SPLIT = re.compile(r"[\t,，、:：]")
 RECORD_SPLIT = re.compile(r"[;；|｜\r\n]+")
 # 端子排名称：含字母或汉字、以 D 结尾，例如 ZD、1-2ID、JD、1-2UD、11YD、TD
 BLOCK_NAME_HINT = re.compile(r"^[0-9\-]*[A-Za-z一-龥][0-9A-Za-z一-龥\-]*[Dd]$")
+COORDINATE_LINE = re.compile(
+    r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*,\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s+(.+?)\s*$"
+)
 CJK_START = 0x2E80
 
 DRAWING = {
@@ -46,7 +48,9 @@ DRAWING = {
     "terminalWidth": 5.0,
     "numberBandHeight": 5.0,
     "blockNameWidth": 10.0,
-    "terminalZoneHeight": 10.0,
+    "terminalZoneHeight": 35.0,
+    "physicalGroupGap": 15.0,
+    "physicalRowGap": 20.0,
     "trunkExtend": 18.0,
     "columnGap": 4.0,
     "chevronLength": 5.0,
@@ -82,10 +86,118 @@ def looks_like_block_name(token: str) -> bool:
     return bool(BLOCK_NAME_HINT.match(token))
 
 
+def unique_block_name(label: str, name_counts: dict[str, int]) -> str:
+    name_counts[label] = name_counts.get(label, 0) + 1
+    return label if name_counts[label] == 1 else "%s@%d" % (label, name_counts[label])
+
+
+def cluster_coordinate_bands(rows: list[dict], gap: float = 50.0) -> list[list[dict]]:
+    bands: list[list[dict]] = []
+    for row in sorted(rows, key=lambda item: item["y"], reverse=True):
+        if not bands or abs(bands[-1][-1]["y"] - row["y"]) > gap:
+            bands.append([row])
+        else:
+            bands[-1].append(row)
+    return bands
+
+
+def parse_vertical_coordinate_terminals(rows: list[dict]):
+    """旧式纵排坐标：相同 X 为一块物理端子排，按 Y 从上到下读取。"""
+    columns = []
+    for row in sorted(rows, key=lambda item: item["x"]):
+        column = next((item for item in columns if abs(item["x"] - row["x"]) <= 0.05), None)
+        if column is None:
+            column = {"x": row["x"], "rows": []}
+            columns.append(column)
+        column["rows"].append(row)
+
+    blocks = []
+    name_counts: dict[str, int] = {}
+    errors = []
+    for column_index, column in enumerate(sorted(columns, key=lambda item: item["x"]), start=1):
+        current = None
+        physical_group = "坐标列-%d" % column_index
+        for row in sorted(column["rows"], key=lambda item: item["y"], reverse=True):
+            token = row["text"]
+            if looks_like_block_name(token):
+                current = {"name": unique_block_name(token, name_counts), "label": token, "terminals": [], "segments": 1,
+                           "layoutGroup": "坐标端子排", "physicalGroup": physical_group,
+                           "sourceColumn": physical_group, "rowOrder": column_index}
+                blocks.append(current)
+            elif current is None:
+                errors.append("坐标列 %d 的“%s”前面没有端子排名称" % (column_index, token))
+            elif token.isdigit():
+                current["terminals"].append(token)
+        if current is None:
+            errors.append("坐标列 %d 没有识别到以 D 结尾的端子排名称" % column_index)
+    return blocks, errors, "纵列"
+
+
+def parse_horizontal_coordinate_terminals(rows: list[dict]):
+    """横排坐标：按水平带分组，再由名称的 X 位置划分每一块端子排。"""
+    blocks = []
+    name_counts: dict[str, int] = {}
+    errors = []
+    block_order = 0
+    for band_index, band in enumerate(cluster_coordinate_bands(rows), start=1):
+        anchors = sorted((row for row in band if looks_like_block_name(row["text"])), key=lambda item: item["x"])
+        if not anchors:
+            continue
+        numeric_rows = [row for row in band if row["text"].isdigit()]
+        for anchor_index, anchor in enumerate(anchors):
+            next_x = anchors[anchor_index + 1]["x"] if anchor_index + 1 < len(anchors) else float("inf")
+            terminals = [row for row in numeric_rows if anchor["x"] < row["x"] < next_x]
+            terminals.sort(key=lambda item: item["x"])
+            if not terminals:
+                errors.append("端子排「%s」右侧没有识别到纯数字端子" % anchor["text"])
+                continue
+            block_order += 1
+            label = anchor["text"]
+            blocks.append({
+                "name": unique_block_name(label, name_counts), "label": label,
+                "terminals": [row["text"] for row in terminals], "segments": 1,
+                "layoutGroup": "坐标端子排", "physicalGroup": "坐标块-%d" % block_order,
+                "rowOrder": block_order, "sourceBand": band_index,
+            })
+    if not blocks:
+        errors.append("坐标清单里没有识别到横向端子排")
+    return blocks, errors, "横排"
+
+
+def parse_coordinate_terminals(text: str):
+    """自动识别纵列型或横排型“X,Y 文字”清单。"""
+    rows = []
+    for line_number, raw in enumerate((text or "").splitlines(), start=1):
+        if not raw.strip():
+            continue
+        match = COORDINATE_LINE.match(raw)
+        if not match:
+            return None, ["第 %d 行不是“横坐标,纵坐标 文字”格式：%s" % (line_number, raw.strip())]
+        rows.append({"x": float(match.group(1)), "y": float(match.group(2)), "text": match.group(3).strip()})
+    if not rows:
+        return None, []
+    anchors = [row for row in rows if looks_like_block_name(row["text"])]
+    numeric_rows = [row for row in rows if row["text"].isdigit()]
+    vertical_matches = sum(1 for row in numeric_rows if any(abs(row["x"] - anchor["x"]) <= 0.05 for anchor in anchors))
+    if numeric_rows and vertical_matches / len(numeric_rows) >= 0.5:
+        blocks, errors, mode = parse_vertical_coordinate_terminals(rows)
+    else:
+        blocks, errors, mode = parse_horizontal_coordinate_terminals(rows)
+    for block in blocks:
+        if not block["terminals"]:
+            errors.append("端子排「%s」后面没有端子号" % block.get("label", block["name"]))
+        block["coordinateMode"] = mode
+    return blocks, errors
+
+
 def parse_terminals(text: str):
     """一块端子排一行：第一项是名称，其余是端子号。
     整段用顿号连着粘过来也认：中途遇到像端子排名称的项就自动开下一块。
     同一个名称分成几段写（厂家图里一条端子排画成两截）会自动接成一块，按出现顺序续端子号。"""
+    nonempty = [line for line in (text or "").splitlines() if line.strip()]
+    if nonempty and COORDINATE_LINE.match(nonempty[0]):
+        return parse_coordinate_terminals(text)
+
     blocks: list[dict] = []
     errors: list[str] = []
     index: dict[str, dict] = {}
@@ -127,9 +239,9 @@ def describe_blocks(blocks: list[dict], with_numbers: bool = False) -> list[str]
     for block in blocks:
         merged = "，%d 段接成一块" % block.get("segments", 1) if block.get("segments", 1) > 1 else ""
         if with_numbers:
-            out.append("%s：%s%s" % (block["name"], "、".join(block["terminals"]) or "（没有端子号）", merged))
+            out.append("%s：%s%s" % (block.get("label", block["name"]), "、".join(block["terminals"]) or "（没有端子号）", merged))
         else:
-            out.append("%s（%d 个端子%s）" % (block["name"], len(block["terminals"]), merged))
+            out.append("%s（%d 个端子%s）" % (block.get("label", block["name"]), len(block["terminals"]), merged))
     return out
 
 
@@ -138,7 +250,7 @@ def resolve_reference(reference: str, blocks: list[dict]):
     text = (reference or "").strip()
     if not text:
         return None, "缺少端子号"
-    candidates = sorted({b["name"] for b in blocks}, key=len, reverse=True)
+    candidates = sorted({b.get("label", b["name"]) for b in blocks}, key=len, reverse=True)
     candidates = [n for n in candidates if text.upper().startswith(n.upper())]
     if not candidates:
         return None, "「%s」对不上任何端子排" % text
@@ -149,11 +261,11 @@ def resolve_reference(reference: str, blocks: list[dict]):
             last = "「%s」只有端子排名称，缺端子号" % text
             continue
         for block in blocks:
-            if block["name"] != name:
+            if block.get("label", block["name"]) != name:
                 continue
             for number in block["terminals"]:
                 if number.upper() == wanted.upper():
-                    return {"block": name, "terminal": number}, ""
+                    return {"block": block["name"], "terminal": number}, ""
         last = "%s 没有 %s 号端子" % (name, wanted)
     return None, last
 
@@ -165,7 +277,7 @@ def looks_like_reference(token: str, blocks: list[dict]) -> bool:
     text = (token or "").strip()
     if not text:
         return False
-    for name in sorted({b["name"] for b in blocks}, key=len, reverse=True):
+    for name in sorted({b.get("label", b["name"]) for b in blocks}, key=len, reverse=True):
         if text.upper().startswith(name.upper()):
             if re.match(r"^[-_\s]*[0-9A-Za-z]+$", text[len(name):]):
                 return True
@@ -198,6 +310,8 @@ def split_wiring_records(text: str, blocks: list[dict]) -> list[list[str]]:
 
 def parse_wiring(text: str, blocks: list[dict], from_cabinet: str, prefix: str):
     """一条记录「端子号、原理号[、去向柜]」；没写去向柜的并入后面第一条写了去向柜的记录。"""
+    if not (text or "").strip():
+        return [], [], [], []
     rows: list[dict] = []
     errors: list[str] = []
     for index, fields in enumerate(split_wiring_records(text, blocks), start=1):
@@ -249,7 +363,7 @@ def parse_wiring(text: str, blocks: list[dict], from_cabinet: str, prefix: str):
     return connections, cables, errors, warnings
 
 
-# ==================== 绘图（与 python-template.js 的固定代码一致） ====================
+# ==================== DXF 绘图 ====================
 
 def natural_key(text: str):
     return [int(part) if part.isdigit() else part.lower() for part in re.split(r"(\d+)", str(text))]
@@ -267,20 +381,25 @@ def build_columns(params, drawing):
     term_w = drawing["terminalWidth"]
     positions = {}
     layouts = []
-    cursor = 0.0
+    cursors = {}
     order = 0
     for block in params["terminalBlocks"]:
+        row_key = block.get("physicalGroup") or "默认行"
+        cursor = cursors.get(row_key, 0.0)
         terminals = [str(t) for t in block["terminals"]]
         start_x = cursor
         first_x = start_x + name_w
         for index, terminal in enumerate(terminals):
             x = first_x + index * term_w
-            positions[(block["name"], terminal)] = {"x": x, "center": x + term_w / 2.0, "order": order}
+            positions[(block["name"], terminal)] = {
+                "x": x, "center": x + term_w / 2.0, "order": order, "rowKey": row_key
+            }
             order += 1
         width = name_w + max(1, len(terminals)) * term_w
-        layouts.append({"name": block["name"], "terminals": terminals, "startX": start_x, "firstX": first_x, "width": width})
-        cursor = start_x + width
-    return positions, layouts, cursor
+        layouts.append({"name": block["name"], "label": block.get("label") or block["name"], "terminals": terminals,
+                        "startX": start_x, "firstX": first_x, "width": width, "rowKey": row_key})
+        cursors[row_key] = start_x + width
+    return positions, layouts, max(cursors.values(), default=0.0)
 
 
 def build_cables(params, positions):
@@ -295,19 +414,21 @@ def build_cables(params, positions):
         if key not in positions:
             skipped.append("%s-%s 端子不存在" % key)
             continue
-        groups.setdefault(number, []).append(connection)
+        row_key = positions[key]["rowKey"]
+        groups.setdefault((number, row_key), []).append(connection)
     cables = []
-    for number, points in groups.items():
+    for (number, row_key), points in groups.items():
         points = sorted(points, key=lambda p: positions[(p["terminalBlock"], str(p["terminal"]))]["center"])
         leftmost = min(positions[(p["terminalBlock"], str(p["terminal"]))]["order"] for p in points)
         cables.append({
             "number": number,
+            "rowKey": row_key,
             "points": points,
             "leftmost": leftmost,
             "destination": next((p.get("toCabinet") for p in points if p.get("toCabinet")), ""),
             "spec": next((p.get("cableSpec") for p in points if p.get("cableSpec")), ""),
         })
-    cables.sort(key=lambda cable: (cable["leftmost"], natural_key(cable["number"])))
+    cables.sort(key=lambda cable: (cable["rowKey"], cable["leftmost"], natural_key(cable["number"])))
     return cables, skipped
 
 
@@ -326,6 +447,8 @@ def build_dxf(params, drawing, output: Path):
     up = str(params.get("direction", "DOWN")).upper() == "UP"
 
     positions, layouts, total_w = build_columns(params, drawing)
+    row_keys = list(dict.fromkeys(layout["rowKey"] for layout in layouts))
+    physical_block_count = len(row_keys)
     cables, skipped = build_cables(params, positions)
     cell_text_h = min(text_h, term_w - 1.5)
     if cell_text_h < text_h:
@@ -333,18 +456,17 @@ def build_dxf(params, drawing, output: Path):
 
     step = max(float(params.get("distanceStep") or 5), text_h * 1.6)
     first = float(params.get("firstDistance") or 10)
-    span = first + max(0, len(cables) - 1) * step
-
-    block_y = 0.0 if up else span
-    band_y0 = block_y + zone_h
-    band_y1 = band_y0 + band_h
-    number_center = band_y0 + band_h / 2.0
-    principle_center = (band_y1 + zone_h / 2.0) if up else (block_y + zone_h / 2.0)
-    pin_y = (block_y + block_h) if up else block_y
-
-    def lane_y(index: int) -> float:
-        offset = first + index * step
-        return pin_y + offset if up else pin_y - offset
+    row_cables = {row_key: [cable for cable in cables if cable["rowKey"] == row_key] for row_key in row_keys}
+    row_plans = {}
+    cursor_y = 0.0
+    row_gap = drawing.get("physicalRowGap", 20.0)
+    for row_key in reversed(row_keys):
+        count = len(row_cables[row_key])
+        span = first + max(0, count - 1) * step if count else 0.0
+        block_y = cursor_y if up else cursor_y + span
+        pin_y = block_y + block_h if up else block_y
+        row_plans[row_key] = {"blockY": block_y, "pinY": pin_y, "span": span}
+        cursor_y += block_h + span + row_gap
 
     gap = drawing["columnGap"]
     bus_x = total_w + drawing["trunkExtend"]
@@ -383,6 +505,10 @@ def build_dxf(params, drawing, output: Path):
         entity.set_placement((x, y), align=align or TextEntityAlignment.MIDDLE_CENTER)
 
     for layout in layouts:
+        block_y = row_plans[layout["rowKey"]]["blockY"]
+        band_y0 = block_y + zone_h
+        band_y1 = band_y0 + band_h
+        number_center = band_y0 + band_h / 2.0
         start_x = layout["startX"]
         first_x = layout["firstX"]
         end_x = start_x + layout["width"]
@@ -396,7 +522,7 @@ def build_dxf(params, drawing, output: Path):
         for index in range(1, len(layout["terminals"])):
             x = first_x + index * term_w
             line((x, block_y), (x, block_y + block_h), layers["frame"])
-        text(layout["name"], start_x + drawing["blockNameWidth"] / 2.0, block_y + block_h / 2.0,
+        text(layout["label"], start_x + drawing["blockNameWidth"] / 2.0, block_y + block_h / 2.0,
              layers["text"], rotation=90.0, height=cell_text_h)
         for terminal in layout["terminals"]:
             center = positions[(layout["name"], terminal)]["center"]
@@ -408,11 +534,17 @@ def build_dxf(params, drawing, output: Path):
         if key in positions and connection.get("principle") and key not in principles:
             principles[key] = connection["principle"]
     for key, value in principles.items():
+        row_key = positions[key]["rowKey"]
+        block_y = row_plans[row_key]["blockY"]
+        principle_center = (block_y + zone_h + band_h + zone_h / 2.0) if up else (block_y + zone_h / 2.0)
         text(value, positions[key]["center"], principle_center, layers["text"], rotation=90.0, height=cell_text_h)
 
     arrow = text_h / 2.0
-    for index, cable in enumerate(cables):
-        y = lane_y(index)
+    for row_key in row_keys:
+      pin_y = row_plans[row_key]["pinY"]
+      for index, cable in enumerate(row_cables[row_key]):
+        offset = first + index * step
+        y = pin_y + offset if up else pin_y - offset
         xs = [positions[(p["terminalBlock"], str(p["terminal"]))]["center"] for p in cable["points"]]
         for x in xs:
             line((x, pin_y), (x, y), layers["wire"])
@@ -424,14 +556,14 @@ def build_dxf(params, drawing, output: Path):
         text("至 " + str(cable["destination"] or "未填写"), dest_x, y + 1.0, layers["label"], align=TextEntityAlignment.BOTTOM_LEFT)
         text(cable["spec"] or "未填写", right_x, y + 1.0, layers["label"], align=TextEntityAlignment.BOTTOM_RIGHT)
 
-    top_y = max(block_y + block_h, lane_y(len(cables) - 1) if (up and cables) else 0.0)
-    bottom_y = min(block_y, lane_y(len(cables) - 1) if (not up and cables) else block_y)
+    top_y = max(plan["blockY"] + block_h + (plan["span"] if up else 0.0) for plan in row_plans.values())
+    bottom_y = min(plan["blockY"] - (plan["span"] if not up else 0.0) for plan in row_plans.values())
     title_y = top_y + text_h * 3.0
     if drawing["drawTitle"]:
         label = str(params.get("projectName") or "")
         text(label, 0.0, title_y, layers["title"], align=TextEntityAlignment.MIDDLE_LEFT, height=text_h * 1.5)
         note = "%d 块端子排 / %d 个端子 / %d 根电缆 / %s" % (
-            len(layouts), len(positions), len(cables), "向上接线" if up else "向下接线")
+            physical_block_count, len(positions), len(cables), "向上接线" if up else "向下接线")
         text(note, right_x, title_y, layers["title"], align=TextEntityAlignment.MIDDLE_RIGHT)
     if drawing["drawFrame"]:
         margin = text_h * 2.0
@@ -442,7 +574,7 @@ def build_dxf(params, drawing, output: Path):
 
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
-    return {"blocks": len(layouts), "terminals": len(positions), "cables": len(cables),
+    return {"blocks": physical_block_count, "segments": len(layouts), "terminals": len(positions), "cables": len(cables),
             "points": sum(len(c["points"]) for c in cables), "skipped": skipped,
             "size": (round(right_x, 1), round(title_y + text_h - bottom_y, 1))}
 
@@ -608,13 +740,13 @@ PAGE = """<!doctype html>
 
   <div class="step">
     <h2><span class="num">1</span>有哪些端子排</h2>
-    <p class="tip">一块端子排写一行：<b>先写端子排名称，后面挨着写端子号</b>，中间用顿号或逗号隔开。<code>N</code>、<code>PE</code>、<code>1A</code> 这种端子号照写。<br>整段从别处复制过来、全部用顿号连成一行也行，遇到下一个端子排名称会自动断开。同一个端子排分成几段写（比如 <code>CD：1…25 ｜ CD：26…36</code>）会自动接成一块。</p>
-    <textarea id="terminals" rows="6" placeholder="ZD、1、11&#10;1-2ID、1、2、3、4&#10;JD、1、4"></textarea>
+    <p class="tip">普通格式：一块端子排写一行，先写名称，再写端子号。<br>坐标格式：可直接粘贴每行 <b>横坐标,纵坐标 文字</b>；相同横坐标归入同一块物理端子排，其中多个不同名称段按纵坐标顺序连续绘制在同一行，纯数字作为端子号，原理号自动忽略。</p>
+    <textarea id="terminals" rows="10" placeholder="20453.52,-4715.01 1QD&#10;20453.52,-4720.01 1&#10;20572.02,-4716.29 CD&#10;20572.02,-4721.29 26"></textarea>
   </div>
 
   <div class="step">
     <h2><span class="num">2</span>怎么接线</h2>
-    <p class="tip">一条接线写一行：<b>端子号、原理号</b>。一根电缆的<b>最后一条</b>再加上<b>去向柜</b>；前面没写去向柜的，自动算成同一根电缆。<br>整段用顿号连成一行也行，遇到下一个端子号会自动断成新的一条。</p>
+    <p class="tip">一条接线写一行：<b>端子号、原理号</b>。一根电缆的<b>最后一条</b>再加上<b>去向柜</b>；前面没写去向柜的，自动算成同一根电缆。只画空端子排时可以留空。</p>
     <textarea id="wiring" rows="11" placeholder="ZD1、+KM1&#10;ZD11、-KM1、直流馈线柜&#10;1-2ID4、1(2)B-N4121&#10;1-2ID1、1(2)B-A4121、35kV 1(2)#主变进线柜"></textarea>
   </div>
 
@@ -628,7 +760,7 @@ PAGE = """<!doctype html>
   </div>
 
   <div id="result"></div>
-  <p class="foot">图纸按 1 个图形单位 = 1mm、文字样式 HZ、宽度因子 0.7、色号 7 生成，框线／文字／接线分图层，全部是可编辑的 LINE 和 TEXT。<br>关掉启动时那个黑色命令行窗口就等于关掉这个工具。需要逐条编辑、看预览或改绘图参数时用同目录的 index.html。</p>
+  <p class="foot">图纸按 1 个图形单位 = 1mm、端子格节距 5、端子排总高 75、文字样式 HZ、宽度因子 0.7、色号 7 生成。每种横坐标生成一条横向端子排，同列多名称段连续排列；每行电缆距离都从 10 开始，按 15、20、25 递增。<br>关掉启动时那个黑色命令行窗口就等于关掉这个工具。</p>
 </div>
 <script>
 const DEMO = __DEMO__;
