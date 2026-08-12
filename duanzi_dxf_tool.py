@@ -30,10 +30,16 @@ try:
 except Exception:
     pass
 
-FIELD_SPLIT = re.compile(r"[\t,，、:：]")
+# 冒号不当作字段分隔符：接线引用里 ZD:2 与 ZD2 等价，半角/全角冒号在名称与编号
+# 交界处可有可无，统一交给 resolve_reference 在解析名称+端子号时剥掉。
+FIELD_SPLIT = re.compile(r"[\t,，、]")
 RECORD_SPLIT = re.compile(r"[;；|｜\r\n]+")
-# 端子排名称：含字母或汉字、以 D 结尾，例如 ZD、1-2ID、JD、1-2UD、11YD、TD
-BLOCK_NAME_HINT = re.compile(r"^[0-9\-]*[A-Za-z一-龥][0-9A-Za-z一-龥\-]*[Dd]$")
+# 端子排名称通常以 D 结尾，也兼容 QD-COM 这类以 -COM 结尾的名称。
+# 不能把“主体字母”和末尾 D 写成两个必需字符，否则 13D 这种单字母名称会被漏掉。
+BLOCK_NAME_HINT = re.compile(r"^(?=.*[A-Za-z一-龥])[0-9A-Za-z一-龥\-]*(?:[Dd]|-[Cc][Oo][Mm])$")
+# 坐标清单里的端子排还可能采用数字编号 + 字母后缀，不一定以 D 结尾，
+# 例如 1-21BS、1-21YKD。限定为数字开头，避免把 A610 这类原理号当成名称。
+COORDINATE_BLOCK_NAME_HINT = re.compile(r"^[0-9]+(?:-[0-9]+)*[A-Za-z]+$")
 COORDINATE_LINE = re.compile(
     r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*,\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s+(.+?)\s*$"
 )
@@ -54,10 +60,13 @@ DRAWING = {
     "physicalRowGap": 20.0,
     "trunkExtend": 18.0,
     "columnGap": 4.0,
-    "chevronLength": 5.0,
-    "numberColMin": 20.0,
-    "destColMin": 60.0,
-    "specColMin": 26.0,
+    # AA整合版本.lsp 的 BIAN 命令标注基准：三角尖点相对电缆线右端左移 40 mm。
+    "bianRightOffset": 40.0,
+    "bianTriangleSide": 5.0,
+    "bianNumberOffset": -20.0,
+    "bianToOffset": 1.5,
+    "bianSpecOffset": 32.0,
+    "bianTextYOffset": 0.5,
     "drawTitle": True,
     "drawFrame": False,
     "layers": {
@@ -83,8 +92,13 @@ def clean_tokens(text: str) -> list[str]:
 
 
 def looks_like_block_name(token: str) -> bool:
-    """端子排名称基本都以 D 结尾（ZD/1-2ID/JD/1-2UD/11YD/TD），端子号（1、N、PE、1A、A610）不会。"""
+    """识别 ZD/1-2ID/JD/QD-COM 等端子排名称，排除普通端子号和原理号。"""
     return bool(BLOCK_NAME_HINT.match(token))
+
+
+def looks_like_coordinate_block_name(token: str) -> bool:
+    """坐标清单额外兼容 1-21BS、1-21YKD 这类不以 D 结尾的编号式名称。"""
+    return looks_like_block_name(token) or bool(COORDINATE_BLOCK_NAME_HINT.match(token))
 
 
 def unique_block_name(label: str, name_counts: dict[str, int]) -> str:
@@ -120,7 +134,7 @@ def parse_vertical_coordinate_terminals(rows: list[dict]):
         physical_group = "坐标列-%d" % column_index
         for row in sorted(column["rows"], key=lambda item: item["y"], reverse=True):
             token = row["text"]
-            if looks_like_block_name(token):
+            if looks_like_coordinate_block_name(token):
                 current = {"name": unique_block_name(token, name_counts), "label": token, "terminals": [], "segments": 1,
                            "layoutGroup": "坐标端子排", "physicalGroup": physical_group,
                            "sourceColumn": physical_group, "rowOrder": column_index}
@@ -141,7 +155,7 @@ def parse_horizontal_coordinate_terminals(rows: list[dict]):
     errors = []
     block_order = 0
     for band_index, band in enumerate(cluster_coordinate_bands(rows), start=1):
-        anchors = sorted((row for row in band if looks_like_block_name(row["text"])), key=lambda item: item["x"])
+        anchors = sorted((row for row in band if looks_like_coordinate_block_name(row["text"])), key=lambda item: item["x"])
         if not anchors:
             continue
         numeric_rows = [row for row in band if row["text"].isdigit()]
@@ -177,7 +191,7 @@ def parse_coordinate_terminals(text: str):
         rows.append({"x": float(match.group(1)), "y": float(match.group(2)), "text": match.group(3).strip()})
     if not rows:
         return None, []
-    anchors = [row for row in rows if looks_like_block_name(row["text"])]
+    anchors = [row for row in rows if looks_like_coordinate_block_name(row["text"])]
     numeric_rows = [row for row in rows if row["text"].isdigit()]
     vertical_matches = sum(1 for row in numeric_rows if any(abs(row["x"] - anchor["x"]) <= 0.05 for anchor in anchors))
     if numeric_rows and vertical_matches / len(numeric_rows) >= 0.5:
@@ -272,17 +286,19 @@ def describe_blocks(blocks: list[dict], with_numbers: bool = False) -> list[str]
 
 
 def resolve_reference(reference: str, blocks: list[dict]):
-    """把 1-2ID4 拆成端子排 1-2ID 和端子号 4；名称前缀重叠时取端子真实存在的那个。"""
+    """把 1-2ID:4、QD:COM1 等引用拆成端子排名称和端子号。"""
     text = (reference or "").strip()
     if not text:
         return None, "缺少端子号"
+    compact_text = re.sub(r"[-_:：\s]+", "", text).upper()
     candidates = sorted({b.get("label", b["name"]) for b in blocks}, key=len, reverse=True)
-    candidates = [n for n in candidates if text.upper().startswith(n.upper())]
+    candidates = [n for n in candidates if compact_text.startswith(re.sub(r"[-_:：\s]+", "", n).upper())]
     if not candidates:
         return None, "「%s」对不上任何端子排" % text
     last = ""
     for name in candidates:
-        wanted = re.sub(r"^[-_\s]+", "", text[len(name):])
+        compact_name = re.sub(r"[-_:：\s]+", "", name).upper()
+        wanted = compact_text[len(compact_name):]
         if not wanted:
             last = "「%s」只有端子排名称，缺端子号" % text
             continue
@@ -297,17 +313,13 @@ def resolve_reference(reference: str, blocks: list[dict]):
 
 
 def looks_like_reference(token: str, blocks: list[dict]) -> bool:
-    """像不像一条接线的开头（某个端子排名称 + 端子号），不要求端子号真的存在。
-    这样「ZD11」写错了也会被当成新的一条，报出「ZD 没有 11 号端子」而不是「项数太多」。
-    去向柜「JD柜」这种带汉字的尾巴不算，避免把去向柜拆成新记录。"""
-    text = (token or "").strip()
-    if not text:
-        return False
-    for name in sorted({b.get("label", b["name"]) for b in blocks}, key=len, reverse=True):
-        if text.upper().startswith(name.upper()):
-            if re.match(r"^[-_\s]*[0-9A-Za-z]+$", text[len(name):]):
-                return True
-    return False
+    """只有确实能对应现有端子的文字才算下一条接线的开头。
+
+    原理号可能恰好以某个端子排名称开头，例如 JD-901；仅按前缀判断会把它
+    错拆成 JD 的 901 号端子。每行第一项仍由 parse_wiring 单独校验输入错误。
+    """
+    resolved, error = resolve_reference(token, blocks)
+    return resolved is not None and not error
 
 
 def split_wiring_records(text: str, blocks: list[dict]) -> list[list[str]]:
@@ -515,16 +527,17 @@ def build_dxf(params, drawing, output: Path):
         row_plans[row_key] = {"blockY": block_y, "pinY": pin_y, "span": span, "up": up}
         cursor_y += block_h + span + row_gap
 
-    gap = drawing["columnGap"]
     bus_x = total_w + drawing["trunkExtend"]
-    number_x = bus_x + gap
-    number_w = max(drawing["numberColMin"], max([text_width(c["number"], text_h, factor) for c in cables] or [0]) + gap)
-    chevron_x = number_x + number_w + gap
-    chevron_tip = chevron_x + drawing["chevronLength"]
-    dest_x = chevron_tip + gap * 0.75
-    dest_w = max(drawing["destColMin"], max([text_width("至 " + str(c["destination"]), text_h, factor) for c in cables] or [0]) + gap * 1.5)
-    spec_w = max(drawing["specColMin"], max([text_width(c["spec"] or "未填写", text_h, factor) for c in cables] or [0]) + gap * 1.5)
-    right_x = dest_x + dest_w + spec_w
+    number_x = bus_x + drawing["columnGap"]
+    marker_tip_x = number_x - drawing["bianNumberOffset"]
+    line_right_x = marker_tip_x + drawing["bianRightOffset"]
+    spec_x = marker_tip_x + drawing["bianSpecOffset"]
+    right_x = max(
+        line_right_x,
+        max([marker_tip_x + drawing["bianToOffset"] + text_width("至" + str(c["destination"] or "未填写"), text_h, factor)
+             for c in cables] or [0]),
+        max([spec_x + text_width(c["spec"] or "未填写", text_h, factor) for c in cables] or [0]),
+    )
 
     doc = ezdxf.new("R2010")
     doc.header["$INSUNITS"] = 4
@@ -540,6 +553,9 @@ def build_dxf(params, drawing, output: Path):
 
     def line(p1, p2, layer):
         msp.add_line(p1, p2, dxfattribs={"layer": layer, "color": color})
+
+    def closed_polyline(points, layer):
+        msp.add_lwpolyline(points, close=True, dxfattribs={"layer": layer, "color": color})
 
     def text(value, x, y, layer, align=None, rotation=0.0, height=None):
         content = str(value or "")
@@ -586,7 +602,9 @@ def build_dxf(params, drawing, output: Path):
         principle_center = (plan["blockY"] + zone_h + band_h + zone_h / 2.0) if plan["up"] else (plan["blockY"] + zone_h / 2.0)
         text(value, positions[key]["center"], principle_center, layers["text"], rotation=90.0, height=cell_text_h)
 
-    arrow = text_h / 2.0
+    triangle_half = drawing["bianTriangleSide"] / 2.0
+    triangle_depth = triangle_half * (3.0 ** 0.5)
+    label_y_offset = drawing["bianTextYOffset"]
     for row_key in row_keys:
       plan = row_plans[row_key]
       pin_y = plan["pinY"]
@@ -597,13 +615,18 @@ def build_dxf(params, drawing, output: Path):
         xs = [p["leadX"] for p in cable["points"]]
         for x in xs:
             line((x, pin_y), (x, y), layers["wire"])
-        line((min(xs), y), (bus_x, y), layers["wire"])
-        text(cable["number"], number_x, y, layers["label"], align=TextEntityAlignment.MIDDLE_LEFT)
-        line((chevron_x, y - arrow), (chevron_tip, y), layers["wire"])
-        line((chevron_x, y + arrow), (chevron_tip, y), layers["wire"])
-        line((chevron_tip, y), (right_x, y), layers["wire"])
-        text("至 " + str(cable["destination"] or "未填写"), dest_x, y + 1.0, layers["label"], align=TextEntityAlignment.BOTTOM_LEFT)
-        text(cable["spec"] or "未填写", right_x, y + 1.0, layers["label"], align=TextEntityAlignment.BOTTOM_RIGHT)
+        line((min(xs), y), (line_right_x, y), layers["wire"])
+        closed_polyline([
+            (marker_tip_x, y),
+            (marker_tip_x - triangle_depth, y + triangle_half),
+            (marker_tip_x - triangle_depth, y - triangle_half),
+        ], layers["wire"])
+        text(cable["number"], marker_tip_x + drawing["bianNumberOffset"], y + label_y_offset,
+             layers["label"], align=TextEntityAlignment.LEFT)
+        text("至" + str(cable["destination"] or "未填写"), marker_tip_x + drawing["bianToOffset"], y + label_y_offset,
+             layers["label"], align=TextEntityAlignment.LEFT)
+        text(cable["spec"] or "未填写", spec_x, y + label_y_offset,
+             layers["label"], align=TextEntityAlignment.LEFT)
 
     top_y = max(plan["blockY"] + block_h + (plan["span"] if plan["up"] else 0.0) for plan in row_plans.values())
     bottom_y = min(plan["blockY"] - (plan["span"] if not plan["up"] else 0.0) for plan in row_plans.values())
@@ -830,7 +853,7 @@ PAGE = """<!doctype html>
   </div>
 
   <div id="result"></div>
-  <p class="foot">图纸按 1 个图形单位 = 1mm、端子格节距 5、端子排总高 75、文字样式 HZ、宽度因子 0.7、色号 7 生成。每种横坐标生成一条横向端子排，同列多名称段连续排列；每行电缆距离都从 10 开始，按 15、20、25 递增。每一块端子排都可以用上面的按钮单独选电缆向上还是向下。<br>关掉启动时那个黑色命令行窗口就等于关掉这个工具。</p>
+  <p class="foot">图纸按 1 个图形单位 = 1mm、端子格节距 5、端子排总高 75、文字样式 HZ、宽度因子 0.7、色号 7 生成。电缆编号、方向三角、“至”、终点柜和规格的位置按 AA整合版本.lsp 的 BIAN 命令布置。每种横坐标生成一条横向端子排，同列多名称段连续排列；每行电缆距离都从 10 开始，按 15、20、25 递增。每一块端子排都可以用上面的按钮单独选电缆向上还是向下。<br>关掉启动时那个黑色命令行窗口就等于关掉这个工具。</p>
 </div>
 <script>
 const DEMO = __DEMO__;
