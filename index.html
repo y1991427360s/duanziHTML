@@ -141,7 +141,7 @@
           <div class="workflow-intro">
             <span class="workflow-kicker">第一步</span>
             <h3>一块端子排一行：先写名称，再写端子号</h3>
-            <p>每一行（或每个分号）就是一块端子排：第一项是端子排名称，后面全部当成端子号，<code>N</code>、<code>PE</code>、<code>1A</code> 这类带字母的端子号也可以直接写。物理上连在一起的几块端子排写在同一段里，中间空一行就换成下一个组合。</p>
+            <p>每一行（或每个分号）就是一块端子排：第一项是端子排名称，后面全部当成端子号，<code>N</code>、<code>PE</code>、<code>1A</code> 这类带字母的端子号也可以直接写。整段用顿号连成一行也认，遇到下一个端子排名称会自动断开。物理上连在一起的几块端子排写在同一段里，中间空一行就换成下一个组合。</p>
           </div>
           <div class="terminal-sequence-guide">
             <div><span>端子排名称</span><strong>1ZD</strong></div><i>、</i><div><span>端子号（可带字母）</span><strong>1、2、3、N、PE</strong></div><i>换行或；</i><div><span>下一块端子排</span><strong>2ZD、1、2、3</strong></div>
@@ -169,7 +169,7 @@
           <div class="workflow-intro">
             <span class="workflow-kicker">第三步</span>
             <h3>粘贴接线资料</h3>
-            <p>一条记录写<b>端子号、原理号</b>；这根电缆的最后一条记录再补上<b>去向柜</b>。没有写去向柜的记录，自动和它后面第一条写了去向柜的记录归成同一根电缆。记录之间用分号或换行分隔。</p>
+            <p>一条记录写<b>端子号、原理号</b>；这根电缆的最后一条记录再补上<b>去向柜</b>。没有写去向柜的记录，自动和它后面第一条写了去向柜的记录归成同一根电缆。记录之间用分号或换行分隔，整段用顿号连成一行也认，遇到下一个端子号会自动断成新的一条。</p>
           </div>
           <div class="connection-format-strip">
             <span>端子号</span><i>、</i><span>原理号</span><i>；</i><span>端子号</span><i>、</i><span>原理号</span><i>、</i><span>去向柜＝这根电缆到此为止</span>

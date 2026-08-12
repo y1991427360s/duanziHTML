@@ -47,6 +47,11 @@ const layerMetrics = (settings) => {
   };
 };
 
+// 端子排名称基本都以 D 结尾（ZD、1-2ID、JD、1-2UD、11YD、TD），端子号（1、N、PE、1A、A610）不会。
+// 靠这一条，可以把整段用顿号连着粘过来的清单自动断成一块块端子排。
+const BLOCK_NAME_HINT = /^[0-9-]*[A-Za-z一-龥][0-9A-Za-z一-龥-]*[Dd]$/;
+const looksLikeBlockName = (token) => BLOCK_NAME_HINT.test(String(token || ""));
+
 const DataManager = {
   normalize(raw) {
     if (!raw || typeof raw !== "object") throw new Error("JSON 根节点必须是对象");
@@ -434,16 +439,23 @@ const WorkflowManager = {
         const units = segment.split(/[;；\r\n]+/).map((unit) => unit.trim()).filter(Boolean);
         const groupBlocks = [];
         units.forEach((unit) => {
-          const [name, ...numbers] = this.tokenizeTerminalSequence(unit);
-          if (!name) throw new Error(`第 ${segmentIndex + 1} 组里有一块端子排没有名称`);
-          if (!numbers.length) throw new Error(`端子排“${name}”后面没有端子号`);
-          const block = { name, layoutGroup: "", terminals: numbers.map((number) => ({ number })) };
-          groupBlocks.push(block);
-          terminalBlocks.push(block);
+          let current = null;
+          this.tokenizeTerminalSequence(unit).forEach((token, index) => {
+            // 每段的第一项是名称；中途再遇到像端子排名称的项就自动开下一块
+            if (index === 0 || !current || looksLikeBlockName(token)) {
+              current = { name: token, layoutGroup: "", terminals: [] };
+              groupBlocks.push(current);
+              terminalBlocks.push(current);
+              return;
+            }
+            current.terminals.push({ number: token });
+          });
         });
         if (groupBlocks.length > 1) groupBlocks.forEach((block) => { block.layoutGroup = `组合端子排-${segmentIndex + 1}`; });
       });
       if (!terminalBlocks.length) throw new Error("没有解析到任何端子排");
+      const empty = terminalBlocks.find((block) => !block.terminals.length);
+      if (empty) throw new Error(`端子排“${empty.name}”后面没有端子号`);
       this.pendingProject = DataManager.normalize({
         projectName: ProjectManager.project.projectName || "手动端子排模板",
         terminalBlocks,
@@ -474,8 +486,6 @@ const WorkflowManager = {
     const suspicious = [];
     project.terminalBlocks.forEach((block) => {
       if (/待确认/.test(block.name) || block.terminals.some((terminal) => /待确认/.test(terminal.number))) suspicious.push(`${block.name} 含有待确认内容`);
-      const looksLikeBlockName = block.terminals.filter((terminal) => /[A-Za-z]D$/i.test(terminal.number)).map((terminal) => terminal.number);
-      if (looksLikeBlockName.length) suspicious.push(`${block.name} 里的端子号 ${looksLikeBlockName.join("、")} 看起来像端子排名称，确认是不是漏了分号或换行`);
     });
     const allIssues = [...issues.map((issue) => issue.text), ...suspicious];
     $("#templateReviewIssues").innerHTML = allIssues.length ? allIssues.map((text) => `<div class="issue warning"><strong>请核对：</strong>${escapeHtml(text)}</div>`).join("") : `<div class="workflow-review-ok">模板结构正常，可以继续导入接线资料。</div>`;
@@ -499,13 +509,34 @@ const WorkflowManager = {
     $("#appendConnectionsMode").classList.toggle("active", mode === "append");
     this.persistDraft();
   },
-  splitConnectionRecords(text) {
-    return String(text || "").split(/[;；\r\n]+/).map((record) => record.trim()).filter(Boolean);
+  // 像不像一条接线的开头（端子排名称 + 端子号），不要求端子号真的存在，
+  // 这样写错的 ZD99 也会另起一条，报「ZD-99 端子不存在」而不是「项数太多」。
+  looksLikeReference(token) {
+    const text = String(token || "").trim();
+    if (!text) return false;
+    const names = [...new Set(ProjectManager.project.terminalBlocks.map((block) => block.name))].sort((a, b) => b.length - a.length);
+    return names.some((name) => text.toUpperCase().startsWith(name.toUpperCase()) && /^[-_\s]*[0-9A-Za-z]+$/.test(text.slice(name.length)));
   },
-  splitRecordFields(record) {
-    const fields = String(record).split(/[\t,，、]/).map((field) => field.trim());
-    while (fields.length && !fields[fields.length - 1]) fields.pop();
-    return fields;
+  // 返回一条条记录的字段数组：先按分号和换行切，再在段内遇到端子引用就另起一条
+  splitConnectionRecords(text) {
+    const records = [];
+    const push = (fields) => {
+      while (fields.length && !fields[fields.length - 1]) fields.pop();
+      if (fields.length) records.push(fields);
+    };
+    String(text || "").split(/[;；\r\n]+/).map((unit) => unit.trim()).filter(Boolean).forEach((unit) => {
+      let current = [];
+      unit.split(/[\t,，、]/).map((field) => field.trim()).forEach((field) => {
+        if (current.length && this.looksLikeReference(field)) {
+          push(current);
+          current = [field];
+        } else {
+          current.push(field);
+        }
+      });
+      push(current);
+    });
+    return records;
   },
   resolveTerminalReference(reference) {
     const normalized = String(reference || "").trim();
@@ -550,12 +581,11 @@ const WorkflowManager = {
       this.persistDraft();
       return;
     }
-    const rows = records.map((record, index) => {
-      const fields = this.splitRecordFields(record);
+    const rows = records.map((fields, index) => {
       const [reference = "", principle = "", toCabinet = ""] = fields;
       const errors = [];
       const warnings = [];
-      if (fields.length > 3) errors.push("一条记录最多 3 项：端子号、原理号、去向柜");
+      if (fields.length > 3) errors.push("项数太多，一条只能写：端子号、原理号、去向柜");
       const resolved = this.resolveTerminalReference(reference);
       if (resolved.error) errors.push(resolved.error);
       if (!principle) warnings.push("原理号为空");

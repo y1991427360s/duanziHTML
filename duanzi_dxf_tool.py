@@ -33,6 +33,8 @@ except Exception:
 
 FIELD_SPLIT = re.compile(r"[\t,，、]")
 RECORD_SPLIT = re.compile(r"[;；\r\n]+")
+# 端子排名称：含字母或汉字、以 D 结尾，例如 ZD、1-2ID、JD、1-2UD、11YD、TD
+BLOCK_NAME_HINT = re.compile(r"^[0-9\-]*[A-Za-z一-龥][0-9A-Za-z一-龥\-]*[Dd]$")
 CJK_START = 0x2E80
 
 DRAWING = {
@@ -71,29 +73,47 @@ def split_fields(text: str) -> list[str]:
     return [part.strip() for part in FIELD_SPLIT.split(text)]
 
 
+def clean_tokens(text: str) -> list[str]:
+    return [part.rstrip("。.!！") for part in split_fields(text) if part.strip()]
+
+
+def looks_like_block_name(token: str) -> bool:
+    """端子排名称基本都以 D 结尾（ZD/1-2ID/JD/1-2UD/11YD/TD），端子号（1、N、PE、1A、A610）不会。"""
+    return bool(BLOCK_NAME_HINT.match(token))
+
+
 def parse_terminals(text: str):
-    """每行（或每个分号）一块端子排：第一项是名称，其余全是端子号。"""
+    """一块端子排一行：第一项是名称，其余是端子号。
+    整段用顿号连着粘过来也认：中途遇到像端子排名称的项就自动开下一块。"""
     blocks: list[dict] = []
     errors: list[str] = []
     for unit in [u.strip() for u in RECORD_SPLIT.split(text or "") if u.strip()]:
-        parts = [p.rstrip("。.!！") for p in split_fields(unit) if p.strip()]
-        if not parts:
+        current: dict | None = None
+        for index, token in enumerate(clean_tokens(unit)):
+            if index == 0 or looks_like_block_name(token) or current is None:
+                current = {"name": token, "terminals": []}
+                blocks.append(current)
+                continue
+            current["terminals"].append(token)
+    for block in blocks:
+        if not block["terminals"]:
+            errors.append("端子排「%s」后面没有端子号" % block["name"])
             continue
-        name, numbers = parts[0], parts[1:]
-        if not numbers:
-            errors.append("端子排「%s」后面没有端子号" % name)
-            continue
-        seen = []
-        for number in numbers:
-            if number in seen:
-                errors.append("端子排「%s」的端子号 %s 重复" % (name, number))
+        kept: list[str] = []
+        repeated: list[str] = []
+        for number in block["terminals"]:
+            if number in kept:
+                if number not in repeated:
+                    repeated.append(number)
             else:
-                seen.append(number)
-        blocks.append({"name": name, "terminals": seen})
+                kept.append(number)
+        if repeated:
+            errors.append("端子排「%s」里这些端子号出现了不止一次：%s" % (block["name"], "、".join(repeated)))
+        block["terminals"] = kept
     names = [b["name"] for b in blocks]
-    for name in set(names):
+    for name in sorted(set(names)):
         if names.count(name) > 1:
-            errors.append("端子排名称「%s」出现了 %d 次" % (name, names.count(name)))
+            errors.append("端子排名称「%s」出现了 %d 次，同名的请合成一块" % (name, names.count(name)))
     if not blocks and not errors:
         errors.append("上面的端子排还没填")
     return blocks, errors
@@ -124,20 +144,55 @@ def resolve_reference(reference: str, blocks: list[dict]):
     return None, last
 
 
+def looks_like_reference(token: str, blocks: list[dict]) -> bool:
+    """像不像一条接线的开头（某个端子排名称 + 端子号），不要求端子号真的存在。
+    这样「ZD11」写错了也会被当成新的一条，报出「ZD 没有 11 号端子」而不是「项数太多」。
+    去向柜「JD柜」这种带汉字的尾巴不算，避免把去向柜拆成新记录。"""
+    text = (token or "").strip()
+    if not text:
+        return False
+    for name in sorted({b["name"] for b in blocks}, key=len, reverse=True):
+        if text.upper().startswith(name.upper()):
+            if re.match(r"^[-_\s]*[0-9A-Za-z]+$", text[len(name):]):
+                return True
+    return False
+
+
+def split_wiring_records(text: str, blocks: list[dict]) -> list[list[str]]:
+    """把接线文字切成一条条记录。
+    先按换行和分号切，再在每一段里遇到「端子排名称+端子号」的项就另起一条，
+    这样整段用顿号连着粘过来也能自动断开。空的原理号（连着两个顿号）保留。"""
+    records: list[list[str]] = []
+
+    def push(chunk: list[str]) -> None:
+        while chunk and not chunk[-1]:
+            chunk.pop()
+        if chunk:
+            records.append(chunk)
+
+    for unit in [u.strip() for u in RECORD_SPLIT.split(text or "") if u.strip()]:
+        current: list[str] = []
+        for token in [part.rstrip("。.!！") for part in split_fields(unit)]:
+            if current and looks_like_reference(token, blocks):
+                push(current)
+                current = [token]
+            else:
+                current.append(token)
+        push(current)
+    return records
+
+
 def parse_wiring(text: str, blocks: list[dict], from_cabinet: str, prefix: str):
     """一条记录「端子号、原理号[、去向柜]」；没写去向柜的并入后面第一条写了去向柜的记录。"""
-    records = [r.strip() for r in RECORD_SPLIT.split(text or "") if r.strip()]
     rows: list[dict] = []
     errors: list[str] = []
-    for index, record in enumerate(records, start=1):
-        fields = split_fields(record)
-        while fields and not fields[-1]:
-            fields.pop()
+    for index, fields in enumerate(split_wiring_records(text, blocks), start=1):
+        record = "、".join(fields)
         reference = fields[0] if fields else ""
         principle = fields[1] if len(fields) > 1 else ""
         destination = fields[2] if len(fields) > 2 else ""
         if len(fields) > 3:
-            errors.append("第 %d 条「%s」超过 3 项，一条只能写 端子号、原理号、去向柜" % (index, record))
+            errors.append("第 %d 条「%s」项数太多，一条只能写 端子号、原理号、去向柜" % (index, record))
             continue
         resolved, error = resolve_reference(reference, blocks)
         if error:
@@ -410,7 +465,12 @@ def generate(payload: dict) -> dict:
     connections, cables, wire_errors, warnings = parse_wiring(payload.get("wiring", ""), blocks, cabinet, prefix)
     errors = block_errors + wire_errors
     if errors:
-        return {"ok": False, "errors": errors}
+        # 一次只让人改前几条，剩下的多半是同一个原因
+        shown = errors[:10]
+        if len(errors) > len(shown):
+            shown.append("……还有 %d 条类似问题，先把上面这些改掉再点一次" % (len(errors) - len(shown)))
+        return {"ok": False, "errors": shown,
+                "parsed": ["%s：%s" % (b["name"], "、".join(b["terminals"]) or "（没有端子号）") for b in blocks]}
     params = {
         "projectName": cabinet or "端子排接线图",
         "direction": payload.get("direction") or DEFAULTS["direction"],
@@ -435,6 +495,7 @@ def generate(payload: dict) -> dict:
         "verify": verify(target, DRAWING),
         "warnings": warnings + result["skipped"],
         "size": "%s × %s mm" % result["size"],
+        "parsed": ["%s（%d 个端子）" % (b["name"], len(b["terminals"])) for b in blocks],
         "stats": {"blocks": result["blocks"], "terminals": result["terminals"],
                   "cables": result["cables"], "points": result["points"]},
         "cables": [{"number": c["number"], "destination": c["destination"] or "未填写",
@@ -516,6 +577,8 @@ PAGE = """<!doctype html>
   .open { height: 40px; padding: 0 22px; border: 1px solid #007f70; border-radius: 6px; background: #fff;
           color: #007f70; font-size: 15px; font-family: inherit; cursor: pointer; }
   .warn { margin-top: 10px; color: #8a6a1f; font-size: 13px; }
+  .parsed { margin-top: 10px; padding: 8px 10px; border-radius: 5px; background: #fff; border: 1px solid #dee6e3;
+            color: #4a5c61; font-family: Consolas, "Microsoft YaHei UI", monospace; font-size: 12.5px; line-height: 1.9; }
   .foot { margin-top: 30px; color: #8b989b; font-size: 12px; line-height: 1.9; }
 </style>
 </head>
@@ -526,13 +589,13 @@ PAGE = """<!doctype html>
 
   <div class="step">
     <h2><span class="num">1</span>有哪些端子排</h2>
-    <p class="tip">一块端子排写一行：<b>先写端子排名称，后面挨着写端子号</b>，中间用顿号或逗号隔开。<code>N</code>、<code>PE</code>、<code>1A</code> 这种端子号照写。</p>
+    <p class="tip">一块端子排写一行：<b>先写端子排名称，后面挨着写端子号</b>，中间用顿号或逗号隔开。<code>N</code>、<code>PE</code>、<code>1A</code> 这种端子号照写。<br>整段从别处复制过来、全部用顿号连成一行也行，遇到下一个端子排名称会自动断开。</p>
     <textarea id="terminals" rows="6" placeholder="ZD、1、11&#10;1-2ID、1、2、3、4&#10;JD、1、4"></textarea>
   </div>
 
   <div class="step">
     <h2><span class="num">2</span>怎么接线</h2>
-    <p class="tip">一条接线写一行：<b>端子号、原理号</b>。一根电缆的<b>最后一条</b>再加上<b>去向柜</b>；前面没写去向柜的，自动算成同一根电缆。</p>
+    <p class="tip">一条接线写一行：<b>端子号、原理号</b>。一根电缆的<b>最后一条</b>再加上<b>去向柜</b>；前面没写去向柜的，自动算成同一根电缆。<br>整段用顿号连成一行也行，遇到下一个端子号会自动断成新的一条。</p>
     <textarea id="wiring" rows="11" placeholder="ZD1、+KM1&#10;ZD11、-KM1、直流馈线柜&#10;1-2ID4、1(2)B-N4121&#10;1-2ID1、1(2)B-A4121、35kV 1(2)#主变进线柜"></textarea>
   </div>
 
@@ -582,10 +645,12 @@ async function build() {
 
 function render(data) {
   const box = $("result");
+  const parsed = (data.parsed && data.parsed.length)
+    ? "<div class=\\"parsed\\">识别到的端子排：" + data.parsed.map(esc).join(" ｜ ") + "</div>" : "";
   if (!data.ok) {
     box.className = "result bad";
     box.innerHTML = "<h3>还差一点，下面几处要改</h3><ul class=\\"errs\\">" +
-      data.errors.map((e) => "<li>" + esc(e) + "</li>").join("") + "</ul>";
+      data.errors.map((e) => "<li>" + esc(e) + "</li>").join("") + "</ul>" + parsed;
     return;
   }
   box.className = "result ok";
@@ -594,7 +659,7 @@ function render(data) {
     "<span class=\\"path\\">" + esc(data.path) + "</span>" +
     "<button class=\\"open\\" id=\\"openBtn\\" type=\\"button\\">用 CAD 打开</button>" +
     "<div style=\\"margin-top:12px\\">" + stats.blocks + " 块端子排 · " + stats.terminals + " 个端子 · " +
-    stats.cables + " 根电缆 · " + stats.points + " 个接线点 · 图幅 " + esc(data.size) + "</div>" +
+    stats.cables + " 根电缆 · " + stats.points + " 个接线点 · 图幅 " + esc(data.size) + "</div>" + parsed +
     "<ul class=\\"cables\\">" + data.cables.map((c) =>
       "<li><b>" + esc(c.number) + "</b> → " + esc(c.destination) + "：" + esc(c.points.join(" ")) + "</li>").join("") + "</ul>" +
     (data.warnings.length ? "<div class=\\"warn\\">" + data.warnings.map(esc).join("<br>") + "</div>" : "") +
