@@ -178,6 +178,7 @@ python "...-出图.py" --open                                # 生成后直接�
 | `python-template.js` | 完整版导出的出图脚本模板，导出时只替换参数区 |
 | `style.css` | 完整版样式 |
 | `*.json` | 示例项目 |
+| `CLAUDE.md` | 给 AI 看的项目约定（硬规则、解析规则要点、验证要求） |
 
 `.gitattributes` 已用 `*.cmd text eol=crlf` 固定批处理换行，避免仓库统一 LF 后再次把启动器改坏。
 

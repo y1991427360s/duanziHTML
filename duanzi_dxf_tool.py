@@ -433,6 +433,12 @@ def build_dxf(params, drawing, output: Path):
         note = "%d 块端子排 / %d 个端子 / %d 根电缆 / %s" % (
             len(layouts), len(positions), len(cables), "向上接线" if up else "向下接线")
         text(note, right_x, title_y, layers["title"], align=TextEntityAlignment.MIDDLE_RIGHT)
+    if drawing["drawFrame"]:
+        margin = text_h * 2.0
+        x0, y0 = -margin, bottom_y - margin
+        x1, y1 = right_x + margin, title_y + text_h * 2.0
+        for p1, p2 in (((x0, y0), (x1, y0)), ((x1, y0), (x1, y1)), ((x1, y1), (x0, y1)), ((x0, y1), (x0, y0))):
+            line(p1, p2, layers["frame"])
 
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
