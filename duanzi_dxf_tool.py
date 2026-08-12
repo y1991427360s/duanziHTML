@@ -46,6 +46,7 @@ DRAWING = {
     "widthFactor": 0.7,
     "color": 7,
     "terminalWidth": 5.0,
+    "terminalLeadSpacing": 1.0,
     "numberBandHeight": 5.0,
     "blockNameWidth": 10.0,
     "terminalZoneHeight": 35.0,
@@ -234,6 +235,31 @@ def parse_terminals(text: str):
     return blocks, errors
 
 
+def parse_strips(text: str) -> list[dict]:
+    """只解析端子排清单，返回每块物理端子排的概览，供页面列出 向上/向下 按钮。
+
+    普通格式的所有端子段在同一块物理端子排（默认行）；坐标格式按横坐标分块。
+    """
+    blocks, _ = parse_terminals(text or "")
+    if not blocks:
+        return []
+    strips: list[dict] = []
+    order: dict[str, int] = {}
+    for block in blocks:
+        key = block.get("physicalGroup") or "默认行"
+        if key not in order:
+            order[key] = len(strips)
+            strips.append({"key": key, "name": block.get("label", block["name"]), "terminals": 0})
+        idx = order[key]
+        name = block.get("label", block["name"])
+        names = [item.strip() for item in strips[idx]["name"].split("、")]
+        if name not in names:
+            names.append(name)
+        strips[idx]["name"] = "、".join(names)
+        strips[idx]["terminals"] += len(block["terminals"])
+    return strips
+
+
 def describe_blocks(blocks: list[dict], with_numbers: bool = False) -> list[str]:
     out = []
     for block in blocks:
@@ -402,7 +428,7 @@ def build_columns(params, drawing):
     return positions, layouts, max(cursors.values(), default=0.0)
 
 
-def build_cables(params, positions):
+def build_cables(params, positions, lead_spacing=1.0):
     groups = {}
     skipped = []
     for connection in params["connections"]:
@@ -415,7 +441,9 @@ def build_cables(params, positions):
             skipped.append("%s-%s 端子不存在" % key)
             continue
         row_key = positions[key]["rowKey"]
-        groups.setdefault((number, row_key), []).append(connection)
+        point = dict(connection)
+        point["terminalKey"] = key
+        groups.setdefault((number, row_key), []).append(point)
     cables = []
     for (number, row_key), points in groups.items():
         points = sorted(points, key=lambda p: positions[(p["terminalBlock"], str(p["terminal"]))]["center"])
@@ -429,6 +457,23 @@ def build_cables(params, positions):
             "spec": next((p.get("cableSpec") for p in points if p.get("cableSpec")), ""),
         })
     cables.sort(key=lambda cable: (cable["rowKey"], cable["leftmost"], natural_key(cable["number"])))
+
+    # 同一端子接多根电缆时，引线以端子中心为基准等距展开。
+    # 电缆按最终绘图顺序从近到远排列，因此最靠左的引线也对应最近的电缆。
+    usage_counts = {}
+    for cable in cables:
+        for point in cable["points"]:
+            key = point["terminalKey"]
+            usage_counts[key] = usage_counts.get(key, 0) + 1
+    usage_indexes = {}
+    for cable in cables:
+        for point in cable["points"]:
+            key = point["terminalKey"]
+            index = usage_indexes.get(key, 0)
+            count = usage_counts[key]
+            point["leadOffset"] = (index - (count - 1) / 2.0) * lead_spacing
+            point["leadX"] = positions[key]["center"] + point["leadOffset"]
+            usage_indexes[key] = index + 1
     return cables, skipped
 
 
@@ -444,12 +489,13 @@ def build_dxf(params, drawing, output: Path):
     zone_h = drawing["terminalZoneHeight"]
     band_h = drawing["numberBandHeight"]
     block_h = zone_h * 2 + band_h
-    up = str(params.get("direction", "DOWN")).upper() == "UP"
+    default_dir = str(params.get("direction", "DOWN")).upper()
+    directions = {str(key): str(value).upper() for key, value in (params.get("directions") or {}).items()}
 
     positions, layouts, total_w = build_columns(params, drawing)
     row_keys = list(dict.fromkeys(layout["rowKey"] for layout in layouts))
     physical_block_count = len(row_keys)
-    cables, skipped = build_cables(params, positions)
+    cables, skipped = build_cables(params, positions, drawing.get("terminalLeadSpacing", 1.0))
     cell_text_h = min(text_h, term_w - 1.5)
     if cell_text_h < text_h:
         skipped.append("端子排内文字高度由 %s 收敛到 %s，避免超出 %s 宽的端子格" % (text_h, cell_text_h, term_w))
@@ -463,9 +509,10 @@ def build_dxf(params, drawing, output: Path):
     for row_key in reversed(row_keys):
         count = len(row_cables[row_key])
         span = first + max(0, count - 1) * step if count else 0.0
+        up = directions.get(row_key, default_dir) == "UP"
         block_y = cursor_y if up else cursor_y + span
         pin_y = block_y + block_h if up else block_y
-        row_plans[row_key] = {"blockY": block_y, "pinY": pin_y, "span": span}
+        row_plans[row_key] = {"blockY": block_y, "pinY": pin_y, "span": span, "up": up}
         cursor_y += block_h + span + row_gap
 
     gap = drawing["columnGap"]
@@ -535,17 +582,19 @@ def build_dxf(params, drawing, output: Path):
             principles[key] = connection["principle"]
     for key, value in principles.items():
         row_key = positions[key]["rowKey"]
-        block_y = row_plans[row_key]["blockY"]
-        principle_center = (block_y + zone_h + band_h + zone_h / 2.0) if up else (block_y + zone_h / 2.0)
+        plan = row_plans[row_key]
+        principle_center = (plan["blockY"] + zone_h + band_h + zone_h / 2.0) if plan["up"] else (plan["blockY"] + zone_h / 2.0)
         text(value, positions[key]["center"], principle_center, layers["text"], rotation=90.0, height=cell_text_h)
 
     arrow = text_h / 2.0
     for row_key in row_keys:
-      pin_y = row_plans[row_key]["pinY"]
+      plan = row_plans[row_key]
+      pin_y = plan["pinY"]
+      up = plan["up"]
       for index, cable in enumerate(row_cables[row_key]):
         offset = first + index * step
         y = pin_y + offset if up else pin_y - offset
-        xs = [positions[(p["terminalBlock"], str(p["terminal"]))]["center"] for p in cable["points"]]
+        xs = [p["leadX"] for p in cable["points"]]
         for x in xs:
             line((x, pin_y), (x, y), layers["wire"])
         line((min(xs), y), (bus_x, y), layers["wire"])
@@ -556,14 +605,22 @@ def build_dxf(params, drawing, output: Path):
         text("至 " + str(cable["destination"] or "未填写"), dest_x, y + 1.0, layers["label"], align=TextEntityAlignment.BOTTOM_LEFT)
         text(cable["spec"] or "未填写", right_x, y + 1.0, layers["label"], align=TextEntityAlignment.BOTTOM_RIGHT)
 
-    top_y = max(plan["blockY"] + block_h + (plan["span"] if up else 0.0) for plan in row_plans.values())
-    bottom_y = min(plan["blockY"] - (plan["span"] if not up else 0.0) for plan in row_plans.values())
+    top_y = max(plan["blockY"] + block_h + (plan["span"] if plan["up"] else 0.0) for plan in row_plans.values())
+    bottom_y = min(plan["blockY"] - (plan["span"] if not plan["up"] else 0.0) for plan in row_plans.values())
     title_y = top_y + text_h * 3.0
     if drawing["drawTitle"]:
         label = str(params.get("projectName") or "")
         text(label, 0.0, title_y, layers["title"], align=TextEntityAlignment.MIDDLE_LEFT, height=text_h * 1.5)
+        up_count = sum(1 for plan in row_plans.values() if plan["up"])
+        down_count = len(row_plans) - up_count
+        if up_count and down_count:
+            direction_note = "向上 %d 块 / 向下 %d 块" % (up_count, down_count)
+        elif up_count:
+            direction_note = "全部向上"
+        else:
+            direction_note = "全部向下"
         note = "%d 块端子排 / %d 个端子 / %d 根电缆 / %s" % (
-            physical_block_count, len(positions), len(cables), "向上接线" if up else "向下接线")
+            physical_block_count, len(positions), len(cables), direction_note)
         text(note, right_x, title_y, layers["title"], align=TextEntityAlignment.MIDDLE_RIGHT)
     if drawing["drawFrame"]:
         margin = text_h * 2.0
@@ -576,6 +633,8 @@ def build_dxf(params, drawing, output: Path):
     doc.saveas(output)
     return {"blocks": physical_block_count, "segments": len(layouts), "terminals": len(positions), "cables": len(cables),
             "points": sum(len(c["points"]) for c in cables), "skipped": skipped,
+            "rows": [{"key": key, "up": plan["up"], "blockY": plan["blockY"], "pinY": plan["pinY"], "span": plan["span"]}
+                     for key, plan in row_plans.items()],
             "size": (round(right_x, 1), round(title_y + text_h - bottom_y, 1))}
 
 
@@ -625,6 +684,7 @@ def generate(payload: dict) -> dict:
     params = {
         "projectName": cabinet or "端子排接线图",
         "direction": payload.get("direction") or DEFAULTS["direction"],
+        "directions": payload.get("directions") or {},
         "firstDistance": DEFAULTS["firstDistance"],
         "distanceStep": DEFAULTS["distanceStep"],
         "textHeight": DEFAULTS["textHeight"],
@@ -730,6 +790,15 @@ PAGE = """<!doctype html>
   .warn { margin-top: 10px; color: #8a6a1f; font-size: 13px; }
   .parsed { margin-top: 10px; padding: 8px 10px; border-radius: 5px; background: #fff; border: 1px solid #dee6e3;
             color: #4a5c61; font-family: Consolas, "Microsoft YaHei UI", monospace; font-size: 12.5px; line-height: 1.9; }
+  .strips { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
+  .strip { display: inline-flex; align-items: center; gap: 8px; padding: 5px 6px 5px 12px; border: 1px solid #d3dddb;
+           border-radius: 999px; background: #f7faf9; font-size: 13px; color: #33504b; }
+  .strip b { font-weight: 600; }
+  .strip .cnt { color: #85938f; font-size: 12px; }
+  .strip button { border: 1px solid #b8c9c4; background: #fff; border-radius: 999px; padding: 3px 12px; font-size: 12.5px;
+                  cursor: pointer; color: #1f6f63; font-family: inherit; }
+  .strip button.up { background: #007f70; border-color: #007f70; color: #fff; }
+  .strips-note { margin: 8px 0 0; color: #8b989b; font-size: 12px; }
   .foot { margin-top: 30px; color: #8b989b; font-size: 12px; line-height: 1.9; }
 </style>
 </head>
@@ -740,8 +809,9 @@ PAGE = """<!doctype html>
 
   <div class="step">
     <h2><span class="num">1</span>有哪些端子排</h2>
-    <p class="tip">普通格式：一块端子排写一行，先写名称，再写端子号。<br>坐标格式：可直接粘贴每行 <b>横坐标,纵坐标 文字</b>；相同横坐标归入同一块物理端子排，其中多个不同名称段按纵坐标顺序连续绘制在同一行，纯数字作为端子号，原理号自动忽略。</p>
+    <p class="tip">普通格式：一块端子排写一行，先写名称，再写端子号。<br>坐标格式：可直接粘贴每行 <b>横坐标,纵坐标 文字</b>；相同横坐标归入同一块物理端子排，其中多个不同名称段按纵坐标顺序连续绘制在同一行，纯数字作为端子号，原理号自动忽略。<br>下面会自动列出每一块端子排，点按钮可以单独选<b>电缆向上还是向下</b>。</p>
     <textarea id="terminals" rows="10" placeholder="20453.52,-4715.01 1QD&#10;20453.52,-4720.01 1&#10;20572.02,-4716.29 CD&#10;20572.02,-4721.29 26"></textarea>
+    <div id="strips" class="strips" style="display:none"></div>
   </div>
 
   <div class="step">
@@ -760,17 +830,66 @@ PAGE = """<!doctype html>
   </div>
 
   <div id="result"></div>
-  <p class="foot">图纸按 1 个图形单位 = 1mm、端子格节距 5、端子排总高 75、文字样式 HZ、宽度因子 0.7、色号 7 生成。每种横坐标生成一条横向端子排，同列多名称段连续排列；每行电缆距离都从 10 开始，按 15、20、25 递增。<br>关掉启动时那个黑色命令行窗口就等于关掉这个工具。</p>
+  <p class="foot">图纸按 1 个图形单位 = 1mm、端子格节距 5、端子排总高 75、文字样式 HZ、宽度因子 0.7、色号 7 生成。每种横坐标生成一条横向端子排，同列多名称段连续排列；每行电缆距离都从 10 开始，按 15、20、25 递增。每一块端子排都可以用上面的按钮单独选电缆向上还是向下。<br>关掉启动时那个黑色命令行窗口就等于关掉这个工具。</p>
 </div>
 <script>
 const DEMO = __DEMO__;
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 
+const directions = {};   // 每一块端子排选的方向：stripKey -> "UP" / "DOWN"
+let lastStrips = [];
+
+async function refreshStrips() {
+  let strips = [];
+  try {
+    const response = await fetch("/strips", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ terminals: $("terminals").value }),
+    });
+    strips = (await response.json()).strips || [];
+  } catch (error) {
+    strips = [];   // 没连上或解析失败就什么都不显示
+  }
+  renderStrips(strips);
+}
+
+function renderStrips(strips) {
+  lastStrips = strips;
+  const box = $("strips");
+  if (!strips.length) {
+    box.style.display = "none";
+    box.innerHTML = "";
+    return;
+  }
+  box.style.display = "flex";
+  box.innerHTML = strips.map((s) => {
+    const up = (directions[s.key] || "DOWN") === "UP";
+    return '<span class="strip"><b>' + esc(s.name) + '</b><span class="cnt">' + s.terminals +
+      ' 端子</span><button type="button" data-key="' + esc(s.key) + '" class="' + (up ? "up" : "") +
+      '">' + (up ? "向上" : "向下") + '</button></span>';
+  }).join("");
+  box.querySelectorAll("button").forEach((btn) => {
+    btn.onclick = () => {
+      const key = btn.dataset.key;
+      directions[key] = (directions[key] || "DOWN") === "UP" ? "DOWN" : "UP";
+      renderStrips(lastStrips);   // 本地重画，不发请求
+    };
+  });
+}
+
+let stripTimer = null;
+$("terminals").addEventListener("input", () => {
+  clearTimeout(stripTimer);
+  stripTimer = setTimeout(refreshStrips, 350);
+});
+
 $("demo").onclick = () => {
   $("terminals").value = DEMO.terminals;
   $("wiring").value = DEMO.wiring;
   $("cabinet").value = DEMO.cabinet;
+  refreshStrips();
 };
 
 async function build() {
@@ -783,7 +902,7 @@ async function build() {
     const response = await fetch("/build", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ terminals: $("terminals").value, wiring: $("wiring").value, cabinet: $("cabinet").value }),
+      body: JSON.stringify({ terminals: $("terminals").value, wiring: $("wiring").value, cabinet: $("cabinet").value, directions }),
     });
     render(await response.json());
   } catch (error) {
@@ -875,7 +994,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, b"not found", "text/plain; charset=utf-8")
 
     def do_POST(self) -> None:
-        if urlparse(self.path).path != "/build":
+        path = urlparse(self.path).path
+        if path not in ("/build", "/strips"):
             self._send(404, b"not found", "text/plain; charset=utf-8")
             return
         try:
@@ -883,6 +1003,9 @@ class Handler(BaseHTTPRequestHandler):
             payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
         except Exception as error:
             self._json({"ok": False, "errors": ["请求读不出来：%s" % error]})
+            return
+        if path == "/strips":
+            self._json({"strips": parse_strips(payload.get("terminals", ""))})
             return
         try:
             result = generate(payload)
