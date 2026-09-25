@@ -13,6 +13,13 @@ html电缆/
 __pycache__/
 *.pyc
 
+# PyInstaller 打包产物（约 108MB，可由 端子排出图工具.spec 重新生成）
+build/
+dist/
+
+# 指向 dist 里 exe 的快捷方式，内含本机绝对路径
+*.lnk
+
 # 系统与编辑器
 Thumbs.db
 desktop.ini

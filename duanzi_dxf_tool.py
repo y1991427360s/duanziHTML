@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
-"""端子排出图工具（简易版）
+"""端子排出图工具 — 解析与绘图核心
 
-双击 `出图工具.cmd`（或运行 python duanzi_dxf_tool.py）后浏览器会自动打开一个很简单的页面：
-两个输入框 + 一个按钮，点一下就在桌面生成 DXF 并自动用 CAD 打开。
+本文件只负责纯逻辑：解析端子/接线文本、计算布局、写出 DXF。没有界面代码，
+`generate()` 是唯一对外入口，桌面版 `duanzi_gui.py` 直接调用它。
 
-不需要学习界面，也不需要先生成脚本。
-
-启动器 `出图工具.cmd` 的内容必须保持纯 ASCII 且用 CRLF 换行，所以本文件用英文名；
+启动器 `端子排出图桌面版.cmd` 必须保持纯 ASCII 且用 CRLF 换行，所以本文件用英文名；
 cmd.exe 按系统代码页读批处理，UTF-8 中文或 LF 换行都会让它把命令行拆错。
 
 依赖：ezdxf（缺少时执行 pip install ezdxf）
@@ -14,16 +12,10 @@ cmd.exe 按系统代码页读批处理，UTF-8 中文或 LF 换行都会让它�
 
 from __future__ import annotations
 
-import json
 import re
-import socket
 import sys
-import threading
-import webbrowser
 from datetime import datetime
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -34,15 +26,20 @@ except Exception:
 # 交界处可有可无，统一交给 resolve_reference 在解析名称+端子号时剥掉。
 FIELD_SPLIT = re.compile(r"[\t,，、]")
 RECORD_SPLIT = re.compile(r"[;；|｜\r\n]+")
-# 端子排名称通常以 D 结尾，也兼容 QD-COM 这类以 -COM 结尾的名称。
-# 不能把“主体字母”和末尾 D 写成两个必需字符，否则 13D 这种单字母名称会被漏掉。
-BLOCK_NAME_HINT = re.compile(r"^(?=.*[A-Za-z一-龥])[0-9A-Za-z一-龥\-]*(?:[Dd]|-[Cc][Oo][Mm])$")
-# 坐标清单里的端子排还可能采用数字编号 + 字母后缀，不一定以 D 结尾，
-# 例如 1-21BS、1-21YKD。限定为数字开头，避免把 A610 这类原理号当成名称。
-COORDINATE_BLOCK_NAME_HINT = re.compile(r"^[0-9]+(?:-[0-9]+)*[A-Za-z]+$")
+# 普通格式仍用名称形态切段：通常以 D 结尾，也兼容 QD-COM、短字母名和 X2。
+# 坐标格式不再猜名称，只认行末「端子名」标记。
+BLOCK_NAME_HINT = re.compile(
+    r"^(?:(?=.*[A-Za-z一-龥])[0-9A-Za-z一-龥\-]*(?:[Dd]|-[Cc][Oo][Mm])|[A-Za-z]{1,4}[0-9]{0,2})$"
+)
 COORDINATE_LINE = re.compile(
     r"^\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s*,\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+))\s+(.+?)\s*$"
 )
+COORDINATE_NAME_MARK = re.compile(r"^(?P<name>.*?)\s*端子名\s*$")
+NUMERIC_TOKEN = re.compile(r"^[+-]?(?:\d+(?:\.\d*)?|\.\d+)$")
+# TEXT 实体只能是单行，粘贴带进来的换行、制表等控制字符会写坏 DXF。
+CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+# CAD 导出的文字插入点常有 0.1~0.3 mm 抖动；按物理列归组时不能使用过严的 0.05。
+COORDINATE_X_TOLERANCE = 0.5
 CJK_START = 0x2E80
 
 DRAWING = {
@@ -51,8 +48,10 @@ DRAWING = {
     "bigfont": "hztxt.shx",
     "widthFactor": 0.7,
     "color": 7,
+    "cableLineColor": 3,
+    "principleColor": 4,
     "terminalWidth": 5.0,
-    "terminalLeadSpacing": 1.0,
+    "terminalLeadSpacing": 1.5,
     "numberBandHeight": 5.0,
     "blockNameWidth": 10.0,
     "terminalZoneHeight": 35.0,
@@ -72,6 +71,7 @@ DRAWING = {
     "layers": {
         "frame": "端子排-框线",
         "text": "端子排-文字",
+        "principle": "接线-原理号",
         "wire": "电缆-接线",
         "label": "电缆-文字",
         "title": "图签-文字",
@@ -96,9 +96,12 @@ def looks_like_block_name(token: str) -> bool:
     return bool(BLOCK_NAME_HINT.match(token))
 
 
-def looks_like_coordinate_block_name(token: str) -> bool:
-    """坐标清单额外兼容 1-21BS、1-21YKD 这类不以 D 结尾的编号式名称。"""
-    return looks_like_block_name(token) or bool(COORDINATE_BLOCK_NAME_HINT.match(token))
+def split_coordinate_name(text: str):
+    """坐标行末带「端子名」则前面是端子排名称；没标就不是名称。"""
+    match = COORDINATE_NAME_MARK.match(text or "")
+    if not match:
+        return None, False
+    return match.group("name").strip(), True
 
 
 def unique_block_name(label: str, name_counts: dict[str, int]) -> str:
@@ -120,7 +123,7 @@ def parse_vertical_coordinate_terminals(rows: list[dict]):
     """旧式纵排坐标：相同 X 为一块物理端子排，按 Y 从上到下读取。"""
     columns = []
     for row in sorted(rows, key=lambda item: item["x"]):
-        column = next((item for item in columns if abs(item["x"] - row["x"]) <= 0.05), None)
+        column = next((item for item in columns if abs(item["x"] - row["x"]) <= COORDINATE_X_TOLERANCE), None)
         if column is None:
             column = {"x": row["x"], "rows": []}
             columns.append(column)
@@ -132,19 +135,28 @@ def parse_vertical_coordinate_terminals(rows: list[dict]):
     for column_index, column in enumerate(sorted(columns, key=lambda item: item["x"]), start=1):
         current = None
         physical_group = "坐标列-%d" % column_index
+        if not any(row.get("isName") for row in column["rows"]):
+            sample = [row["text"] for row in sorted(column["rows"], key=lambda item: item["y"], reverse=True)
+                      if row.get("text")][:3]
+            sample_text = "、".join(sample)
+            errors.append(
+                "坐标列 %d（横坐标 %.2f）没有标「端子名」的端子排名称；该列示例文字：%s。"
+                "请在本列任意一行补写「端子排名称 端子名」"
+                % (column_index, column["x"], sample_text or "（空）")
+            )
+            continue
         for row in sorted(column["rows"], key=lambda item: item["y"], reverse=True):
             token = row["text"]
-            if looks_like_coordinate_block_name(token):
+            if row.get("isName"):
                 current = {"name": unique_block_name(token, name_counts), "label": token, "terminals": [], "segments": 1,
                            "layoutGroup": "坐标端子排", "physicalGroup": physical_group,
                            "sourceColumn": physical_group, "rowOrder": column_index}
                 blocks.append(current)
-            elif current is None:
-                errors.append("坐标列 %d 的“%s”前面没有端子排名称" % (column_index, token))
-            elif token.isdigit():
-                current["terminals"].append(token)
-        if current is None:
-            errors.append("坐标列 %d 没有识别到以 D 结尾的端子排名称" % column_index)
+            elif token:
+                if current is None:
+                    errors.append("坐标列 %d 的“%s”前面没有端子排名称" % (column_index, token))
+                else:
+                    current["terminals"].append(token)
     return blocks, errors, "纵列"
 
 
@@ -155,16 +167,25 @@ def parse_horizontal_coordinate_terminals(rows: list[dict]):
     errors = []
     block_order = 0
     for band_index, band in enumerate(cluster_coordinate_bands(rows), start=1):
-        anchors = sorted((row for row in band if looks_like_coordinate_block_name(row["text"])), key=lambda item: item["x"])
+        anchors = sorted((row for row in band if row.get("isName")), key=lambda item: item["x"])
+        terminal_rows = sorted((row for row in band if not row.get("isName") and row["text"]),
+                               key=lambda item: item["x"])
+        # 和纵列模式一致：没有归属的文字必须报出来，不能静默丢掉（漏标「端子名」会让整排端子从图上消失）。
         if not anchors:
+            if terminal_rows:
+                errors.append("纵坐标 %.2f 附近的一排文字没有标「端子名」的端子排名称；示例文字：%s。"
+                              "请在这一排补写「端子排名称 端子名」"
+                              % (band[0]["y"], "、".join(row["text"] for row in terminal_rows[:3])))
             continue
-        numeric_rows = [row for row in band if row["text"].isdigit()]
+        orphans = [row["text"] for row in terminal_rows if row["x"] <= anchors[0]["x"]]
+        if orphans:
+            errors.append("纵坐标 %.2f 附近的“%s”左边没有端子排名称" % (band[0]["y"], "、".join(orphans[:3])))
         for anchor_index, anchor in enumerate(anchors):
             next_x = anchors[anchor_index + 1]["x"] if anchor_index + 1 < len(anchors) else float("inf")
-            terminals = [row for row in numeric_rows if anchor["x"] < row["x"] < next_x]
-            terminals.sort(key=lambda item: item["x"])
+            # 右端取闭区间：正好落在下一个名称横坐标上的文字归前一块，不会两边都不要。
+            terminals = [row for row in terminal_rows if anchor["x"] < row["x"] <= next_x]
             if not terminals:
-                errors.append("端子排「%s」右侧没有识别到纯数字端子" % anchor["text"])
+                errors.append("端子排「%s」右侧没有识别到端子号" % anchor["text"])
                 continue
             block_order += 1
             label = anchor["text"]
@@ -175,29 +196,45 @@ def parse_horizontal_coordinate_terminals(rows: list[dict]):
                 "rowOrder": block_order, "sourceBand": band_index,
             })
     if not blocks:
-        errors.append("坐标清单里没有识别到横向端子排")
+        errors.append("坐标清单里没有标「端子名」的横向端子排")
     return blocks, errors, "横排"
 
 
 def parse_coordinate_terminals(text: str):
-    """自动识别纵列型或横排型“X,Y 文字”清单。"""
+    """自动识别纵列型或横排型“X,Y 文字”清单；仅行末「端子名」建立端子排，其余文字均为端子号。"""
     rows = []
+    errors = []
     for line_number, raw in enumerate((text or "").splitlines(), start=1):
         if not raw.strip():
             continue
         match = COORDINATE_LINE.match(raw)
         if not match:
-            return None, ["第 %d 行不是“横坐标,纵坐标 文字”格式：%s" % (line_number, raw.strip())]
-        rows.append({"x": float(match.group(1)), "y": float(match.group(2)), "text": match.group(3).strip()})
+            # 返回空列表而不是 None：调用方会先把 blocks 交给 parse_wiring，None 会抛 TypeError。
+            return [], ["第 %d 行不是“横坐标,纵坐标 文字”格式：%s。"
+                        "两种格式不能混用，请整段统一" % (line_number, raw.strip())]
+        token = match.group(3).strip()
+        name, marked = split_coordinate_name(token)
+        if marked and not name:
+            errors.append("第 %d 行标了端子名，但名称是空的" % line_number)
+            continue
+        rows.append({
+            "x": float(match.group(1)),
+            "y": float(match.group(2)),
+            "text": name if marked else token,
+            "isName": marked,
+        })
     if not rows:
-        return None, []
-    anchors = [row for row in rows if looks_like_coordinate_block_name(row["text"])]
-    numeric_rows = [row for row in rows if row["text"].isdigit()]
-    vertical_matches = sum(1 for row in numeric_rows if any(abs(row["x"] - anchor["x"]) <= 0.05 for anchor in anchors))
-    if numeric_rows and vertical_matches / len(numeric_rows) >= 0.5:
-        blocks, errors, mode = parse_vertical_coordinate_terminals(rows)
+        return [], errors
+    if not any(row.get("isName") for row in rows):
+        return [], errors + ["坐标清单里没有标「端子名」的端子排名称。请写成「X 端子名」这种格式"]
+    anchors = [row for row in rows if row.get("isName")]
+    terminal_rows = [row for row in rows if not row.get("isName") and row["text"]]
+    vertical_matches = sum(1 for row in terminal_rows if any(abs(row["x"] - anchor["x"]) <= COORDINATE_X_TOLERANCE for anchor in anchors))
+    if terminal_rows and vertical_matches / len(terminal_rows) >= 0.5:
+        blocks, parse_errors, mode = parse_vertical_coordinate_terminals(rows)
     else:
-        blocks, errors, mode = parse_horizontal_coordinate_terminals(rows)
+        blocks, parse_errors, mode = parse_horizontal_coordinate_terminals(rows)
+    errors.extend(parse_errors)
     for block in blocks:
         if not block["terminals"]:
             errors.append("端子排「%s」后面没有端子号" % block.get("label", block["name"]))
@@ -216,6 +253,11 @@ def parse_terminals(text: str):
     blocks: list[dict] = []
     errors: list[str] = []
     index: dict[str, dict] = {}
+    # 只看首行会把后面混进来的坐标行当成顿号字段，静默画出「-100.0」这种假端子排。
+    for line_number, raw in enumerate((text or "").splitlines(), start=1):
+        if raw.strip() and COORDINATE_LINE.match(raw):
+            return [], ["第 %d 行是坐标格式，但整段按普通格式解析：%s。"
+                        "两种格式不能混用，请整段统一" % (line_number, raw.strip())]
     for unit in [u.strip() for u in RECORD_SPLIT.split(text or "") if u.strip()]:
         current: dict | None = None
         for position, token in enumerate(clean_tokens(unit)):
@@ -230,6 +272,11 @@ def parse_terminals(text: str):
                 continue
             current["terminals"].append(token)
     for block in blocks:
+        if NUMERIC_TOKEN.match(block["name"]):
+            # 真实端子排名称都带字母；纯数字多半是漏写名称，或坐标用了制表符而没按坐标格式识别。
+            errors.append("端子排名称「%s」是纯数字，多半是漏写了名称；"
+                          "坐标格式每行要写成「横坐标,纵坐标 文字」" % block["name"])
+            continue
         if not block["terminals"]:
             errors.append("端子排「%s」后面没有端子号" % block["name"])
             continue
@@ -250,28 +297,26 @@ def parse_terminals(text: str):
 
 
 def parse_strips(text: str) -> list[dict]:
-    """只解析端子排清单，返回每块物理端子排的概览，供页面列出 向上/向下 按钮。
+    """只解析端子排清单，返回每块物理端子排的概览，供界面列出 向上/向下 按钮。
 
     普通格式的所有端子段在同一块物理端子排（默认行）；坐标格式按横坐标分块。
     """
     blocks, _ = parse_terminals(text or "")
-    if not blocks:
-        return []
-    strips: list[dict] = []
-    order: dict[str, int] = {}
+    return strips_from_blocks(blocks)
+
+
+def strips_from_blocks(blocks: list[dict]) -> list[dict]:
+    """把已解析的端子段按物理端子排汇总，界面已有解析结果时不必再解析一遍。"""
+    strips: dict[str, dict] = {}
     for block in blocks:
         key = block.get("physicalGroup") or "默认行"
-        if key not in order:
-            order[key] = len(strips)
-            strips.append({"key": key, "name": block.get("label", block["name"]), "terminals": 0})
-        idx = order[key]
-        name = block.get("label", block["name"])
-        names = [item.strip() for item in strips[idx]["name"].split("、")]
-        if name not in names:
-            names.append(name)
-        strips[idx]["name"] = "、".join(names)
-        strips[idx]["terminals"] += len(block["terminals"])
-    return strips
+        strip = strips.setdefault(key, {"key": key, "names": [], "terminals": 0})
+        label = block.get("label", block["name"])
+        if label not in strip["names"]:
+            strip["names"].append(label)
+        strip["terminals"] += len(block["terminals"])
+    return [{"key": strip["key"], "name": "、".join(strip["names"]), "terminals": strip["terminals"]}
+            for strip in strips.values()]
 
 
 def describe_blocks(blocks: list[dict], with_numbers: bool = False) -> list[str]:
@@ -285,31 +330,78 @@ def describe_blocks(blocks: list[dict], with_numbers: bool = False) -> list[str]
     return out
 
 
-def resolve_reference(reference: str, blocks: list[dict]):
-    """把 1-2ID:4、QD:COM1 等引用拆成端子排名称和端子号。"""
+def duplicate_terminal_warnings(blocks: list[dict]) -> list[str]:
+    """坐标格式保留重复端子号（普通格式直接报错），提醒接线只会落在第一次出现的那格。"""
+    warnings = []
+    for block in blocks:
+        seen: set[str] = set()
+        repeated: list[str] = []
+        for number in block["terminals"]:
+            if number in seen and number not in repeated:
+                repeated.append(number)
+            seen.add(number)
+        if repeated:
+            warnings.append("端子排「%s」里端子号 %s 出现了不止一次，每格都照画，接线接在第一次出现的那格"
+                            % (block.get("label", block["name"]), "、".join(repeated)))
+    return warnings
+
+
+def compact_reference(text: str) -> str:
+    return re.sub(r"[-_:：\s]+", "", text or "").upper()
+
+
+def separator_positions(label: str) -> set[int]:
+    """名称里分隔符（连字符、冒号、空白）在去掉分隔符后的位置，如 QD-COM 为 {2}。"""
+    positions, length = set(), 0
+    for part in re.split(r"[-_:：\s]+", label.strip())[:-1]:
+        length += len(part)
+        positions.add(length)
+    return positions
+
+
+def reference_matches(reference: str, blocks: list[dict]):
+    """列出引用能对上的全部 (名称, 端子排, 端子号)，名称长的排前面；一个都对不上时附原因。
+
+    忽略冒号、连字符和空白后按名称前缀匹配，较长名称优先（X251 是 X2 的 51 号）。
+    写了冒号时冒号必须落在名称末尾，或落在名称自带的分隔符上：X2:1 只能是 X2 的 1 号，
+    X:21 只能是 X 的 21 号，互不串用；QD:COM1 的冒号对上 QD-COM 里的连字符，仍是它的 1 号。
+    """
     text = (reference or "").strip()
     if not text:
-        return None, "缺少端子号"
-    compact_text = re.sub(r"[-_:：\s]+", "", text).upper()
-    candidates = sorted({b.get("label", b["name"]) for b in blocks}, key=len, reverse=True)
-    candidates = [n for n in candidates if compact_text.startswith(re.sub(r"[-_:：\s]+", "", n).upper())]
-    if not candidates:
-        return None, "「%s」对不上任何端子排" % text
-    last = ""
-    for name in candidates:
-        compact_name = re.sub(r"[-_:：\s]+", "", name).upper()
+        return [], "缺少端子号"
+    compact_text = compact_reference(text)
+    colon = re.search(r"[:：]", text)
+    colon_at = len(compact_reference(text[:colon.start()])) if colon else None
+    # 按块出现顺序去重再按长度排，同长名称的先后才稳定，不受集合遍历顺序影响。
+    labels = sorted(dict.fromkeys(block.get("label", block["name"]) for block in blocks),
+                    key=lambda label: len(compact_reference(label)), reverse=True)
+    matches: list[tuple[str, str, str]] = []
+    reason = "「%s」对不上任何端子排" % text
+    for label in labels:
+        compact_name = compact_reference(label)
+        if not compact_name or not compact_text.startswith(compact_name):
+            continue
+        if colon_at is not None and colon_at != len(compact_name) and colon_at not in separator_positions(label):
+            continue
         wanted = compact_text[len(compact_name):]
         if not wanted:
-            last = "「%s」只有端子排名称，缺端子号" % text
+            reason = "「%s」只有端子排名称，缺端子号" % text
             continue
-        for block in blocks:
-            if block.get("label", block["name"]) != name:
-                continue
-            for number in block["terminals"]:
-                if number.upper() == wanted.upper():
-                    return {"block": block["name"], "terminal": number}, ""
-        last = "%s 没有 %s 号端子" % (name, wanted)
-    return None, last
+        found = [(label, block["name"], number) for block in blocks if block.get("label", block["name"]) == label
+                 for number in block["terminals"] if compact_reference(number) == wanted]
+        if not found:
+            reason = "%s 没有 %s 号端子" % (label, wanted)
+        matches.extend(dict.fromkeys(found))
+    return matches, "" if matches else reason
+
+
+def resolve_reference(reference: str, blocks: list[dict]):
+    """把 1-2ID:4、QD:COM1 等引用拆成端子排名称和端子号；有多种拆法时取名称最长的。"""
+    matches, reason = reference_matches(reference, blocks)
+    if not matches:
+        return None, reason
+    _, block, terminal = matches[0]
+    return {"block": block, "terminal": terminal}, ""
 
 
 def looks_like_reference(token: str, blocks: list[dict]) -> bool:
@@ -352,6 +444,7 @@ def parse_wiring(text: str, blocks: list[dict], from_cabinet: str, prefix: str):
         return [], [], [], []
     rows: list[dict] = []
     errors: list[str] = []
+    ambiguous: list[str] = []
     for index, fields in enumerate(split_wiring_records(text, blocks), start=1):
         record = "、".join(fields)
         reference = fields[0] if fields else ""
@@ -360,11 +453,18 @@ def parse_wiring(text: str, blocks: list[dict], from_cabinet: str, prefix: str):
         if len(fields) > 3:
             errors.append("第 %d 条「%s」项数太多，一条只能写 端子号、原理号、去向柜" % (index, record))
             continue
-        resolved, error = resolve_reference(reference, blocks)
+        matches, error = reference_matches(reference, blocks)
         if error:
             errors.append("第 %d 条「%s」：%s" % (index, record, error))
             continue
-        rows.append({"index": index, "block": resolved["block"], "terminal": resolved["terminal"],
+        if len(matches) > 1:
+            options = ["%s:%s" % (label, number) for label, _, number in matches]
+            if len(set(options)) < len(options):
+                options = ["%s:%s" % (name, number) for _, name, number in matches]
+            ambiguous.append("第 %d 条「%s」可以理解成 %s，按 %s 接；要接别的请用冒号写明，如 %s"
+                             % (index, reference, "、".join(options), options[0], options[1]))
+        _, block, terminal = matches[0]
+        rows.append({"index": index, "block": block, "terminal": terminal,
                      "principle": principle, "destination": destination})
     seen: dict[tuple, int] = {}
     repeated: list[str] = []
@@ -385,7 +485,7 @@ def parse_wiring(text: str, blocks: list[dict], from_cabinet: str, prefix: str):
     if bucket:
         cables.append({"rows": bucket, "destination": "", "closed": False})
     connections: list[dict] = []
-    warnings: list[str] = list(repeated)
+    warnings: list[str] = ambiguous + repeated
     for order, cable in enumerate(cables, start=1):
         cable["number"] = "%s-%02d" % (prefix, order)
         if not cable["closed"]:
@@ -429,12 +529,14 @@ def build_columns(params, drawing):
         first_x = start_x + name_w
         for index, terminal in enumerate(terminals):
             x = first_x + index * term_w
-            positions[(block["name"], terminal)] = {
+            # 坐标格式允许同一块里端子号重复：每格照画，接线落在第一次出现的那格，不能让后一格覆盖前一格。
+            positions.setdefault((block["name"], terminal), {
                 "x": x, "center": x + term_w / 2.0, "order": order, "rowKey": row_key
-            }
+            })
             order += 1
         width = name_w + max(1, len(terminals)) * term_w
         layouts.append({"name": block["name"], "label": block.get("label") or block["name"], "terminals": terminals,
+                        "centers": [first_x + (index + 0.5) * term_w for index in range(len(terminals))],
                         "startX": start_x, "firstX": first_x, "width": width, "rowKey": row_key})
         cursors[row_key] = start_x + width
     return positions, layouts, max(cursors.values(), default=0.0)
@@ -489,7 +591,7 @@ def build_cables(params, positions, lead_spacing=1.0):
     return cables, skipped
 
 
-def build_dxf(params, drawing, output: Path):
+def build_dxf(params, drawing, output: Path, wiring_output: Path | None = None):
     import ezdxf
     from ezdxf.enums import TextEntityAlignment
 
@@ -505,6 +607,7 @@ def build_dxf(params, drawing, output: Path):
     directions = {str(key): str(value).upper() for key, value in (params.get("directions") or {}).items()}
 
     positions, layouts, total_w = build_columns(params, drawing)
+    terminal_count = sum(len(layout["terminals"]) for layout in layouts)
     row_keys = list(dict.fromkeys(layout["rowKey"] for layout in layouts))
     physical_block_count = len(row_keys)
     cables, skipped = build_cables(params, positions, drawing.get("terminalLeadSpacing", 1.0))
@@ -549,21 +652,28 @@ def build_dxf(params, drawing, output: Path):
     for layer_name in layers.values():
         if layer_name not in doc.layers:
             doc.layers.new(layer_name, dxfattribs={"color": color})
+    # 锁层只防止修改；跨 CAD 的纯接线复制由独立 DXF 保证。
+    for role in ("frame", "text", "title"):
+        doc.layers.get(layers[role]).lock()
     msp = doc.modelspace()
 
-    def line(p1, p2, layer):
-        msp.add_line(p1, p2, dxfattribs={"layer": layer, "color": color})
+    def line(p1, p2, layer, entity_color=None):
+        msp.add_line(p1, p2, dxfattribs={
+            "layer": layer,
+            "color": color if entity_color is None else entity_color,
+        })
 
     def closed_polyline(points, layer):
         msp.add_lwpolyline(points, close=True, dxfattribs={"layer": layer, "color": color})
 
-    def text(value, x, y, layer, align=None, rotation=0.0, height=None):
-        content = str(value or "")
+    def text(value, x, y, layer, align=None, rotation=0.0, height=None, entity_color=None):
+        content = CONTROL_CHARS.sub(" ", str(value or "")).strip()
         if not content:
             return
         entity = msp.add_text(content, dxfattribs={
             "style": style_name, "height": height or text_h, "width": factor,
-            "color": color, "layer": layer, "rotation": rotation,
+            "color": color if entity_color is None else entity_color,
+            "layer": layer, "rotation": rotation,
         })
         entity.set_placement((x, y), align=align or TextEntityAlignment.MIDDLE_CENTER)
 
@@ -587,8 +697,7 @@ def build_dxf(params, drawing, output: Path):
             line((x, block_y), (x, block_y + block_h), layers["frame"])
         text(layout["label"], start_x + drawing["blockNameWidth"] / 2.0, block_y + block_h / 2.0,
              layers["text"], rotation=90.0, height=cell_text_h)
-        for terminal in layout["terminals"]:
-            center = positions[(layout["name"], terminal)]["center"]
+        for terminal, center in zip(layout["terminals"], layout["centers"]):
             text(terminal, center, number_center, layers["text"], rotation=90.0, height=cell_text_h)
 
     principles = {}
@@ -599,8 +708,16 @@ def build_dxf(params, drawing, output: Path):
     for key, value in principles.items():
         row_key = positions[key]["rowKey"]
         plan = row_plans[row_key]
-        principle_center = (plan["blockY"] + zone_h + band_h + zone_h / 2.0) if plan["up"] else (plan["blockY"] + zone_h / 2.0)
-        text(value, positions[key]["center"], principle_center, layers["text"], rotation=90.0, height=cell_text_h)
+        # 旋转 90 度后，MIDDLE_LEFT / MIDDLE_RIGHT 分别锚定文字的下端 / 上端；
+        # 不能用 MIDDLE_CENTER，否则原理号始终会落在端子区中间。
+        if plan["up"]:
+            principle_y = plan["blockY"] + block_h - 2.0
+            principle_align = TextEntityAlignment.MIDDLE_RIGHT
+        else:
+            principle_y = plan["blockY"] + 2.0
+            principle_align = TextEntityAlignment.MIDDLE_LEFT
+        text(value, positions[key]["center"], principle_y, layers["principle"], align=principle_align, rotation=90.0,
+             height=cell_text_h, entity_color=drawing.get("principleColor", 4))
 
     triangle_half = drawing["bianTriangleSide"] / 2.0
     triangle_depth = triangle_half * (3.0 ** 0.5)
@@ -615,7 +732,13 @@ def build_dxf(params, drawing, output: Path):
         xs = [p["leadX"] for p in cable["points"]]
         for x in xs:
             line((x, pin_y), (x, y), layers["wire"])
-        line((min(xs), y), (line_right_x, y), layers["wire"])
+            if up:
+                # SJ：在竖直引线最上端添加 1 x 1 mm 上接斜短线。
+                line((x + 1.0, y), (x, y - 1.0), layers["wire"])
+            else:
+                # XJ：在竖直引线最下端添加 1 x 1 mm 下接斜短线。
+                line((x + 1.0, y), (x, y + 1.0), layers["wire"])
+        line((min(xs), y), (line_right_x, y), layers["wire"], drawing.get("cableLineColor", 3))
         closed_polyline([
             (marker_tip_x, y),
             (marker_tip_x - triangle_depth, y + triangle_half),
@@ -643,7 +766,7 @@ def build_dxf(params, drawing, output: Path):
         else:
             direction_note = "全部向下"
         note = "%d 块端子排 / %d 个端子 / %d 根电缆 / %s" % (
-            physical_block_count, len(positions), len(cables), direction_note)
+            physical_block_count, terminal_count, len(cables), direction_note)
         text(note, right_x, title_y, layers["title"], align=TextEntityAlignment.MIDDLE_RIGHT)
     if drawing["drawFrame"]:
         margin = text_h * 2.0
@@ -654,7 +777,14 @@ def build_dxf(params, drawing, output: Path):
 
     output.parent.mkdir(parents=True, exist_ok=True)
     doc.saveas(output)
-    return {"blocks": physical_block_count, "segments": len(layouts), "terminals": len(positions), "cables": len(cables),
+    if wiring_output is not None:
+        wiring_layers = {layers[role] for role in ("principle", "wire", "label")}
+        for entity in list(msp):
+            if entity.dxf.layer not in wiring_layers:
+                msp.delete_entity(entity)
+        wiring_output.parent.mkdir(parents=True, exist_ok=True)
+        doc.saveas(wiring_output)
+    return {"blocks": physical_block_count, "segments": len(layouts), "terminals": terminal_count, "cables": len(cables),
             "points": sum(len(c["points"]) for c in cables), "skipped": skipped,
             "rows": [{"key": key, "up": plan["up"], "blockY": plan["blockY"], "pinY": plan["pinY"], "span": plan["span"]}
                      for key, plan in row_plans.items()],
@@ -689,12 +819,17 @@ def desktop_dir() -> Path:
 
 
 def safe_name(value: str) -> str:
-    return re.sub(r'[\\/:*?"<>|\r\n\t]', "_", (value or "").strip()) or "端子排"
+    # Windows 文件名不能含控制符、不能以点或空格结尾，也不能是 CON/NUL 等保留名。
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", (value or "").strip()).rstrip(". ")
+    if re.fullmatch(r"(?i)(con|prn|aux|nul|com\d|lpt\d)(\..*)?", name):
+        name = "_" + name
+    return name[:120] or "端子排"
 
 
 def generate(payload: dict) -> dict:
     blocks, block_errors = parse_terminals(payload.get("terminals", ""))
-    cabinet = (payload.get("cabinet") or "").strip()
+    # 柜名同时用于图签和文件名，粘贴带进来的换行、制表符一律并成单个空格。
+    cabinet = " ".join((payload.get("cabinet") or "").split())
     prefix = (payload.get("prefix") or DEFAULTS["cablePrefix"]).strip() or DEFAULTS["cablePrefix"]
     connections, cables, wire_errors, warnings = parse_wiring(payload.get("wiring", ""), blocks, cabinet, prefix)
     errors = block_errors + wire_errors
@@ -714,20 +849,29 @@ def generate(payload: dict) -> dict:
         "terminalBlocks": blocks,
         "connections": connections,
     }
-    target = desktop_dir() / (safe_name(cabinet or "端子排") + "-端子排接线图.dxf")
+    folder = Path(payload["outputDir"]) if payload.get("outputDir") else desktop_dir()
+    base = safe_name(cabinet or "端子排") + "-端子排接线图"
+    target = folder / (base + ".dxf")
+    wiring_target = folder / (base + "-仅接线.dxf")
     try:
-        result = build_dxf(params, DRAWING, target)
-    except (OSError, PermissionError):
-        target = target.with_name("%s-%s.dxf" % (target.stem, datetime.now().strftime("%H%M%S")))
-        result = build_dxf(params, DRAWING, target)
-    global LAST_OUTPUT
-    LAST_OUTPUT = target
+        result = build_dxf(params, DRAWING, target, wiring_target)
+    except OSError:
+        # 同名图多半正开在 CAD 里被占用，换带时间戳的新名字再写一次。
+        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        target = folder / ("%s-%s.dxf" % (base, stamp))
+        wiring_target = folder / ("%s-%s-仅接线.dxf" % (base, stamp))
+        try:
+            result = build_dxf(params, DRAWING, target, wiring_target)
+        except OSError as error:
+            return {"ok": False, "errors": ["无法写入 %s：%s" % (folder, error)],
+                    "parsed": describe_blocks(blocks, with_numbers=True)}
     return {
         "ok": True,
         "path": str(target),
+        "wiringPath": str(wiring_target),
         "folder": str(target.parent),
         "verify": verify(target, DRAWING),
-        "warnings": warnings + result["skipped"],
+        "warnings": duplicate_terminal_warnings(blocks) + warnings + result["skipped"],
         "size": "%s × %s mm" % result["size"],
         "parsed": describe_blocks(blocks),
         "stats": {"blocks": result["blocks"], "terminals": result["terminals"],
@@ -736,8 +880,6 @@ def generate(payload: dict) -> dict:
                     "points": ["%s-%s" % (r["block"], r["terminal"]) for r in c["rows"]]} for c in cables],
     }
 
-
-LAST_OUTPUT: Path | None = None
 
 EXAMPLE_TERMINALS = "ZD、1、11\n1-2ID、1、2、3、4\nJD、1、4\n1ID、1、2、3、6\n1-2UD、1、2、3、4、6"
 EXAMPLE_WIRING = "\n".join([
@@ -761,313 +903,3 @@ EXAMPLE_WIRING = "\n".join([
 ])
 EXAMPLE_CABINET = "35kV 1#主变保护柜"
 
-# ==================== 页面 ====================
-
-PAGE = """<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>端子排出图</title>
-<style>
-  * { box-sizing: border-box; }
-  body { margin: 0; padding: 34px 20px 60px; background: #f4f6f5; color: #1f2a2e;
-         font-family: "Microsoft YaHei UI", "Microsoft YaHei", system-ui, sans-serif; }
-  .wrap { max-width: 860px; margin: 0 auto; }
-  h1 { margin: 0 0 6px; font-size: 25px; letter-spacing: .5px; }
-  .sub { margin: 0 0 26px; color: #6b7a7e; font-size: 14px; }
-  .step { margin-bottom: 20px; padding: 18px 20px; border: 1px solid #dde3e2; border-radius: 8px;
-          background: #fff; box-shadow: 0 1px 2px rgba(20,40,45,.04); }
-  .step h2 { display: flex; align-items: center; gap: 9px; margin: 0 0 4px; font-size: 16px; }
-  .num { display: grid; place-items: center; width: 24px; height: 24px; border-radius: 50%;
-         background: #007f70; color: #fff; font-size: 13px; }
-  .tip { margin: 0 0 11px 33px; color: #74848a; font-size: 13px; line-height: 1.7; }
-  .tip b { color: #1f6f63; font-weight: 600; }
-  textarea { width: 100%; padding: 12px 13px; border: 1px solid #ccd5d5; border-radius: 6px; outline: 0;
-             background: #fcfdfd; color: #1c2a2e; font-family: Consolas, "Microsoft YaHei UI", monospace;
-             font-size: 14px; line-height: 1.85; resize: vertical; }
-  textarea:focus { border-color: #007f70; box-shadow: 0 0 0 3px rgba(0,127,112,.12); background: #fff; }
-  .go { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; margin-top: 4px; }
-  .go label { color: #55666b; font-size: 14px; }
-  .go input[type=text] { width: 240px; height: 44px; padding: 0 12px; border: 1px solid #ccd5d5;
-                         border-radius: 6px; outline: 0; font-size: 15px; font-family: inherit; }
-  button.main { height: 52px; padding: 0 40px; border: 0; border-radius: 6px; background: #007f70;
-                color: #fff; font-size: 18px; font-family: inherit; letter-spacing: 2px; cursor: pointer; }
-  button.main:hover { background: #00695d; }
-  button.main:disabled { background: #9db3ae; cursor: default; }
-  .link { border: 0; background: none; color: #007f70; font-size: 13px; font-family: inherit;
-          cursor: pointer; text-decoration: underline; padding: 0; }
-  .result { margin-top: 22px; padding: 18px 20px; border-radius: 8px; font-size: 14px; line-height: 1.8; }
-  .result.ok { border: 1px solid #b9dcd3; background: #eef8f4; }
-  .result.bad { border: 1px solid #e6c3bb; background: #fdf1ee; }
-  .result h3 { margin: 0 0 8px; font-size: 17px; }
-  .path { display: block; margin: 6px 0 12px; padding: 9px 11px; border-radius: 5px; background: #fff;
-          border: 1px solid #d7e2de; font-family: Consolas, monospace; font-size: 13px; word-break: break-all; }
-  .cables { margin: 10px 0 0; padding: 0; list-style: none; }
-  .cables li { padding: 6px 0; border-top: 1px dashed #cfdcd8; font-family: Consolas, "Microsoft YaHei UI", monospace; }
-  .cables b { color: #10574c; }
-  .errs { margin: 6px 0 0; padding-left: 20px; }
-  .errs li { padding: 2px 0; }
-  .open { height: 40px; padding: 0 22px; border: 1px solid #007f70; border-radius: 6px; background: #fff;
-          color: #007f70; font-size: 15px; font-family: inherit; cursor: pointer; }
-  .warn { margin-top: 10px; color: #8a6a1f; font-size: 13px; }
-  .parsed { margin-top: 10px; padding: 8px 10px; border-radius: 5px; background: #fff; border: 1px solid #dee6e3;
-            color: #4a5c61; font-family: Consolas, "Microsoft YaHei UI", monospace; font-size: 12.5px; line-height: 1.9; }
-  .strips { margin-top: 10px; display: flex; flex-wrap: wrap; gap: 8px; }
-  .strip { display: inline-flex; align-items: center; gap: 8px; padding: 5px 6px 5px 12px; border: 1px solid #d3dddb;
-           border-radius: 999px; background: #f7faf9; font-size: 13px; color: #33504b; }
-  .strip b { font-weight: 600; }
-  .strip .cnt { color: #85938f; font-size: 12px; }
-  .strip button { border: 1px solid #b8c9c4; background: #fff; border-radius: 999px; padding: 3px 12px; font-size: 12.5px;
-                  cursor: pointer; color: #1f6f63; font-family: inherit; }
-  .strip button.up { background: #007f70; border-color: #007f70; color: #fff; }
-  .strips-note { margin: 8px 0 0; color: #8b989b; font-size: 12px; }
-  .foot { margin-top: 30px; color: #8b989b; font-size: 12px; line-height: 1.9; }
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>端子排出图</h1>
-  <p class="sub">填下面两个框，点一下「生成图纸」，桌面上就有 DXF，直接用 CAD 打开。<button class="link" id="demo" type="button">填入示例看看</button></p>
-
-  <div class="step">
-    <h2><span class="num">1</span>有哪些端子排</h2>
-    <p class="tip">普通格式：一块端子排写一行，先写名称，再写端子号。<br>坐标格式：可直接粘贴每行 <b>横坐标,纵坐标 文字</b>；相同横坐标归入同一块物理端子排，其中多个不同名称段按纵坐标顺序连续绘制在同一行，纯数字作为端子号，原理号自动忽略。<br>下面会自动列出每一块端子排，点按钮可以单独选<b>电缆向上还是向下</b>。</p>
-    <textarea id="terminals" rows="10" placeholder="20453.52,-4715.01 1QD&#10;20453.52,-4720.01 1&#10;20572.02,-4716.29 CD&#10;20572.02,-4721.29 26"></textarea>
-    <div id="strips" class="strips" style="display:none"></div>
-  </div>
-
-  <div class="step">
-    <h2><span class="num">2</span>怎么接线</h2>
-    <p class="tip">一条接线写一行：<b>端子号、原理号</b>。一根电缆的<b>最后一条</b>再加上<b>去向柜</b>；前面没写去向柜的，自动算成同一根电缆。只画空端子排时可以留空。</p>
-    <textarea id="wiring" rows="11" placeholder="ZD1、+KM1&#10;ZD11、-KM1、直流馈线柜&#10;1-2ID4、1(2)B-N4121&#10;1-2ID1、1(2)B-A4121、35kV 1(2)#主变进线柜"></textarea>
-  </div>
-
-  <div class="step">
-    <h2><span class="num">3</span>出图</h2>
-    <p class="tip">柜名会写在图纸标题和电缆的起点柜上，留空也能出图。</p>
-    <div class="go">
-      <label>柜名<br><input id="cabinet" type="text" placeholder="35kV 1#主变保护柜"></label>
-      <button class="main" id="build" type="button">生成图纸</button>
-    </div>
-  </div>
-
-  <div id="result"></div>
-  <p class="foot">图纸按 1 个图形单位 = 1mm、端子格节距 5、端子排总高 75、文字样式 HZ、宽度因子 0.7、色号 7 生成。电缆编号、方向三角、“至”、终点柜和规格的位置按 AA整合版本.lsp 的 BIAN 命令布置。每种横坐标生成一条横向端子排，同列多名称段连续排列；每行电缆距离都从 10 开始，按 15、20、25 递增。每一块端子排都可以用上面的按钮单独选电缆向上还是向下。<br>关掉启动时那个黑色命令行窗口就等于关掉这个工具。</p>
-</div>
-<script>
-const DEMO = __DEMO__;
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-
-const directions = {};   // 每一块端子排选的方向：stripKey -> "UP" / "DOWN"
-let lastStrips = [];
-
-async function refreshStrips() {
-  let strips = [];
-  try {
-    const response = await fetch("/strips", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ terminals: $("terminals").value }),
-    });
-    strips = (await response.json()).strips || [];
-  } catch (error) {
-    strips = [];   // 没连上或解析失败就什么都不显示
-  }
-  renderStrips(strips);
-}
-
-function renderStrips(strips) {
-  lastStrips = strips;
-  const box = $("strips");
-  if (!strips.length) {
-    box.style.display = "none";
-    box.innerHTML = "";
-    return;
-  }
-  box.style.display = "flex";
-  box.innerHTML = strips.map((s) => {
-    const up = (directions[s.key] || "DOWN") === "UP";
-    return '<span class="strip"><b>' + esc(s.name) + '</b><span class="cnt">' + s.terminals +
-      ' 端子</span><button type="button" data-key="' + esc(s.key) + '" class="' + (up ? "up" : "") +
-      '">' + (up ? "向上" : "向下") + '</button></span>';
-  }).join("");
-  box.querySelectorAll("button").forEach((btn) => {
-    btn.onclick = () => {
-      const key = btn.dataset.key;
-      directions[key] = (directions[key] || "DOWN") === "UP" ? "DOWN" : "UP";
-      renderStrips(lastStrips);   // 本地重画，不发请求
-    };
-  });
-}
-
-let stripTimer = null;
-$("terminals").addEventListener("input", () => {
-  clearTimeout(stripTimer);
-  stripTimer = setTimeout(refreshStrips, 350);
-});
-
-$("demo").onclick = () => {
-  $("terminals").value = DEMO.terminals;
-  $("wiring").value = DEMO.wiring;
-  $("cabinet").value = DEMO.cabinet;
-  refreshStrips();
-};
-
-async function build() {
-  const button = $("build");
-  button.disabled = true;
-  button.textContent = "正在出图…";
-  $("result").className = "";
-  $("result").innerHTML = "";
-  try {
-    const response = await fetch("/build", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ terminals: $("terminals").value, wiring: $("wiring").value, cabinet: $("cabinet").value, directions }),
-    });
-    render(await response.json());
-  } catch (error) {
-    render({ ok: false, errors: ["工具没连上：" + error.message + "。确认那个黑色命令行窗口还开着。"] });
-  } finally {
-    button.disabled = false;
-    button.textContent = "生成图纸";
-  }
-}
-
-function render(data) {
-  const box = $("result");
-  const parsed = (data.parsed && data.parsed.length)
-    ? "<div class=\\"parsed\\">识别到的端子排：" + data.parsed.map(esc).join(" ｜ ") + "</div>" : "";
-  if (!data.ok) {
-    box.className = "result bad";
-    box.innerHTML = "<h3>还差一点，下面几处要改</h3><ul class=\\"errs\\">" +
-      data.errors.map((e) => "<li>" + esc(e) + "</li>").join("") + "</ul>" + parsed;
-    return;
-  }
-  box.className = "result ok";
-  const stats = data.stats;
-  box.innerHTML = "<h3>图纸好了</h3>" +
-    "<span class=\\"path\\">" + esc(data.path) + "</span>" +
-    "<button class=\\"open\\" id=\\"openBtn\\" type=\\"button\\">用 CAD 打开</button>" +
-    "<div style=\\"margin-top:12px\\">" + stats.blocks + " 块端子排 · " + stats.terminals + " 个端子 · " +
-    stats.cables + " 根电缆 · " + stats.points + " 个接线点 · 图幅 " + esc(data.size) + "</div>" + parsed +
-    "<ul class=\\"cables\\">" + data.cables.map((c) =>
-      "<li><b>" + esc(c.number) + "</b> → " + esc(c.destination) + "：" + esc(c.points.join(" ")) + "</li>").join("") + "</ul>" +
-    (data.warnings.length ? "<div class=\\"warn\\">" + data.warnings.map(esc).join("<br>") + "</div>" : "") +
-    "<div class=\\"warn\\" style=\\"color:#6b7a7e\\">" + esc(data.verify) + "</div>";
-  $("openBtn").onclick = async () => { await fetch("/open"); };
-}
-
-$("build").onclick = build;
-["terminals", "wiring", "cabinet"].forEach((id) => $(id).addEventListener("keydown", (event) => {
-  if (event.ctrlKey && event.key === "Enter") build();
-}));
-</script>
-</body>
-</html>
-"""
-
-
-# ==================== 本地小服务 ====================
-
-def page_html() -> bytes:
-    demo = json.dumps({"terminals": EXAMPLE_TERMINALS, "wiring": EXAMPLE_WIRING, "cabinet": EXAMPLE_CABINET},
-                      ensure_ascii=False)
-    return PAGE.replace("__DEMO__", demo).encode("utf-8")
-
-
-class Handler(BaseHTTPRequestHandler):
-    server_version = "DuanziDXF/1.0"
-
-    def log_message(self, *args):  # 不往命令行刷访问日志
-        pass
-
-    def _send(self, code: int, body: bytes, content_type: str) -> None:
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.end_headers()
-        self.wfile.write(body)
-
-    def _json(self, data: dict, code: int = 200) -> None:
-        self._send(code, json.dumps(data, ensure_ascii=False).encode("utf-8"), "application/json; charset=utf-8")
-
-    def do_GET(self) -> None:
-        path = urlparse(self.path).path
-        if path in ("/", "/index.html"):
-            self._send(200, page_html(), "text/html; charset=utf-8")
-        elif path == "/favicon.ico":
-            self.send_response(204)
-            self.end_headers()
-        elif path == "/open":
-            # 只允许打开刚生成的那份图纸，不接受任意路径
-            if LAST_OUTPUT and LAST_OUTPUT.exists():
-                try:
-                    import os
-                    os.startfile(str(LAST_OUTPUT))
-                    self._json({"ok": True})
-                except Exception as error:
-                    self._json({"ok": False, "errors": [str(error)]})
-            else:
-                self._json({"ok": False, "errors": ["还没有生成图纸"]})
-        else:
-            self._send(404, b"not found", "text/plain; charset=utf-8")
-
-    def do_POST(self) -> None:
-        path = urlparse(self.path).path
-        if path not in ("/build", "/strips"):
-            self._send(404, b"not found", "text/plain; charset=utf-8")
-            return
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-            payload = json.loads(self.rfile.read(length).decode("utf-8") or "{}")
-        except Exception as error:
-            self._json({"ok": False, "errors": ["请求读不出来：%s" % error]})
-            return
-        if path == "/strips":
-            self._json({"strips": parse_strips(payload.get("terminals", ""))})
-            return
-        try:
-            result = generate(payload)
-        except Exception as error:
-            result = {"ok": False, "errors": ["出图失败：%s：%s" % (type(error).__name__, error)]}
-        if result.get("ok"):
-            print("已出图：%s" % result["path"])
-        else:
-            for item in result.get("errors", []):
-                print("输入有问题：%s" % item)
-        self._json(result)
-
-
-def free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return int(probe.getsockname()[1])
-
-
-def main() -> int:
-    try:
-        import ezdxf  # noqa: F401
-    except ImportError:
-        print("缺少 ezdxf，请先在命令行执行：pip install ezdxf")
-        input("按回车关闭…")
-        return 2
-    port = free_port()
-    url = "http://127.0.0.1:%d/" % port
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print("端子排出图工具已启动：%s" % url)
-    print("浏览器没自动打开就把上面这行地址粘到浏览器里。")
-    print("图纸会存到桌面。用完直接关掉这个窗口就行。")
-    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("已关闭。")
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
